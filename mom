@@ -36,6 +36,7 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local ContextActionService = game:GetService("ContextActionService")
+local CollectionService = game:GetService("CollectionService")
 
 local LocalPlayer = Players.LocalPlayer
 local flyEnabled = false
@@ -199,6 +200,175 @@ addConnection(LocalPlayer.CharacterAdded:Connect(function()
 end))
 
 -- ============================================================
+--  ตัวค้นหาของดี/ไข่ดีสำหรับแอดมิน
+--  ใส่ Tag "GoodItem" หรือ "GoodEgg" ให้ Model/Part ใน Roblox Studio
+--  นอก Studio ต้องให้ Server ตั้ง Attribute CooHubAdmin = true ที่ Player
+-- ============================================================
+local finderStates = {
+    GoodItem = false,
+    GoodEgg = false,
+}
+local finderMarkers = {
+    GoodItem = {},
+    GoodEgg = {},
+}
+local finderColors = {
+    GoodItem = Color3.fromRGB(255, 205, 45),
+    GoodEgg = Color3.fromRGB(120, 220, 255),
+}
+local finderLabels = {
+    GoodItem = "ของดี",
+    GoodEgg = "ไข่ดี",
+}
+local finderElapsed = 0
+
+local function canUseAdminFinder()
+    return RunService:IsStudio()
+        or (game.CreatorType == Enum.CreatorType.User and LocalPlayer.UserId == game.CreatorId)
+        or LocalPlayer:GetAttribute("CooHubAdmin") == true
+end
+
+local function getFinderPart(instance)
+    if instance:IsA("BasePart") then
+        return instance
+    end
+    if instance:IsA("Model") then
+        return instance.PrimaryPart or instance:FindFirstChildWhichIsA("BasePart", true)
+    end
+    return instance:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function removeFinderMarker(tagName, instance)
+    local marker = finderMarkers[tagName][instance]
+    if not marker then
+        return
+    end
+
+    if marker.highlight then marker.highlight:Destroy() end
+    if marker.billboard then marker.billboard:Destroy() end
+    finderMarkers[tagName][instance] = nil
+end
+
+local function clearFinderMarkers(tagName)
+    for instance in pairs(finderMarkers[tagName]) do
+        removeFinderMarker(tagName, instance)
+    end
+end
+
+local function addFinderMarker(tagName, instance)
+    if finderMarkers[tagName][instance] or not instance:IsDescendantOf(workspace) then
+        return
+    end
+
+    local part = getFinderPart(instance)
+    if not part then
+        return
+    end
+
+    local color = finderColors[tagName]
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "CooHub" .. tagName .. "Highlight"
+    highlight.Adornee = (instance:IsA("Model") or instance:IsA("BasePart")) and instance or part
+    highlight.FillColor = color
+    highlight.FillTransparency = 0.55
+    highlight.OutlineColor = Color3.new(1, 1, 1)
+    highlight.OutlineTransparency = 0
+    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.Parent = instance
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "CooHub" .. tagName .. "Label"
+    billboard.Adornee = part
+    billboard.AlwaysOnTop = true
+    billboard.MaxDistance = 2500
+    billboard.Size = UDim2.fromOffset(190, 42)
+    billboard.StudsOffsetWorldSpace = Vector3.new(0, 3, 0)
+    billboard.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+    local label = Instance.new("TextLabel")
+    label.Name = "Label"
+    label.BackgroundColor3 = Color3.fromRGB(15, 15, 18)
+    label.BackgroundTransparency = 0.2
+    label.BorderSizePixel = 0
+    label.Size = UDim2.fromScale(1, 1)
+    label.Font = Enum.Font.GothamBold
+    label.TextColor3 = color
+    label.TextScaled = true
+    label.TextStrokeTransparency = 0.45
+    label.Parent = billboard
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = label
+
+    finderMarkers[tagName][instance] = {
+        highlight = highlight,
+        billboard = billboard,
+        label = label,
+        part = part,
+    }
+end
+
+local function refreshFinder(tagName)
+    if not finderStates[tagName] then
+        clearFinderMarkers(tagName)
+        return
+    end
+
+    if not canUseAdminFinder() then
+        finderStates[tagName] = false
+        clearFinderMarkers(tagName)
+        warn("[Coo Hub] ไม่มีสิทธิ์ใช้ตัวค้นหาแอดมิน")
+        return
+    end
+
+    local taggedNow = {}
+    for _, instance in ipairs(CollectionService:GetTagged(tagName)) do
+        if instance:IsDescendantOf(workspace) then
+            taggedNow[instance] = true
+            addFinderMarker(tagName, instance)
+        end
+    end
+
+    for instance in pairs(finderMarkers[tagName]) do
+        if not taggedNow[instance] or not instance.Parent then
+            removeFinderMarker(tagName, instance)
+        end
+    end
+end
+
+local function updateFinderDistances()
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not root then
+        return
+    end
+
+    for tagName, markers in pairs(finderMarkers) do
+        for instance, marker in pairs(markers) do
+            if not instance.Parent or not marker.part or not marker.part.Parent then
+                removeFinderMarker(tagName, instance)
+            else
+                local distance = (root.Position - marker.part.Position).Magnitude
+                marker.label.Text = string.format("%s: %s  •  %.0f เมตร", finderLabels[tagName], instance.Name, distance)
+            end
+        end
+    end
+end
+
+addConnection(RunService.Heartbeat:Connect(function(deltaTime)
+    finderElapsed += deltaTime
+    if finderElapsed < 0.35 then
+        return
+    end
+    finderElapsed = 0
+
+    refreshFinder("GoodItem")
+    refreshFinder("GoodEgg")
+    updateFinderDistances()
+end))
+
+-- ============================================================
 --  Window
 -- ============================================================
 local Window = Rayfield:CreateWindow({
@@ -251,6 +421,39 @@ MainTab:CreateSlider({
    end,
 })
 
+MainTab:CreateSection("ตัวค้นหาแอดมิน")
+
+MainTab:CreateParagraph({
+   Title = "วิธีตั้งค่า",
+   Content = "ติด Tag GoodItem ให้ของดี และ GoodEgg ให้ไข่ดีใน Studio\nเจ้าของเกมใช้ได้ทันที; แอดมินอื่นตั้ง Attribute CooHubAdmin = true จาก Server",
+})
+
+MainTab:CreateToggle({
+   Name = "แสดงของดี",
+   CurrentValue = false,
+   Flag = "CooHubGoodItemFinder",
+   Callback = function(value)
+      finderStates.GoodItem = value and canUseAdminFinder()
+      if value and not finderStates.GoodItem then
+         warn("[Coo Hub] เปิดตัวค้นหาไม่ได้: ไม่มีสิทธิ์แอดมิน")
+      end
+      refreshFinder("GoodItem")
+   end,
+})
+
+MainTab:CreateToggle({
+   Name = "แสดงไข่ดี",
+   CurrentValue = false,
+   Flag = "CooHubGoodEggFinder",
+   Callback = function(value)
+      finderStates.GoodEgg = value and canUseAdminFinder()
+      if value and not finderStates.GoodEgg then
+         warn("[Coo Hub] เปิดตัวค้นหาไม่ได้: ไม่มีสิทธิ์แอดมิน")
+      end
+      refreshFinder("GoodEgg")
+   end,
+})
+
 MainTab:CreateSection("ข้อมูล")
 
 MainTab:CreateParagraph({
@@ -270,6 +473,10 @@ MainTab:CreateParagraph({
 -- ============================================================
 getgenv().CooHubUnload = function()
     stopFly()
+    finderStates.GoodItem = false
+    finderStates.GoodEgg = false
+    clearFinderMarkers("GoodItem")
+    clearFinderMarkers("GoodEgg")
 
     for _, conn in ipairs(connections) do
         pcall(function() conn:Disconnect() end)
