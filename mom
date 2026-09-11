@@ -1,5 +1,7 @@
 -- ============================================================
---  Coo Hub V2.1  |  ADMIN FLY
+--  Coo Hub V3.0  |  เกมขุด + เก็บไข่
+--  ระบบ: บิน / ตัวค้นหาแอดมิน / Auto Dig / Auto เก็บของ
+--          ESP ไข่-ของหายาก / Module Dump
 -- ============================================================
 
 -- กันรันซ้ำ: ถ้าโหลดอยู่แล้วให้ปิดของเก่าก่อน
@@ -37,6 +39,7 @@ local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local ContextActionService = game:GetService("ContextActionService")
 local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LocalPlayer = Players.LocalPlayer
 local flyEnabled = false
@@ -369,10 +372,563 @@ addConnection(RunService.Heartbeat:Connect(function(deltaTime)
 end))
 
 -- ============================================================
+--  เครื่องมือช่วยเหลือ (Utility)
+-- ============================================================
+
+-- แปลงข้อความ "a, b, c" เป็นตารางคำค้น
+local function parseKeywords(text)
+    local list = {}
+    for word in string.gmatch(text or "", "[^,]+") do
+        local trimmed = string.lower(word)
+        trimmed = trimmed:match("^%s*(.-)%s*$")
+        if trimmed and trimmed ~= "" then
+            table.insert(list, trimmed)
+        end
+    end
+    return list
+end
+
+-- หา RootPart ของตัวละครตัวเอง
+local function getMyRoot()
+    local character = LocalPlayer.Character
+    return character and character:FindFirstChild("HumanoidRootPart")
+end
+
+-- ข้ามตัวละครผู้เล่น (ไม่อยากให้ ESP ไปติดกรอบใส่กันเอง)
+local function isPlayerCharacter(instance)
+    local model = instance:IsA("Model") and instance or instance:FindFirstAncestorOfClass("Model")
+    if model and Players:GetPlayerFromCharacter(model) then
+        return true
+    end
+
+    local node = instance.Parent
+    for _ = 1, 6 do
+        if not node or node == workspace then break end
+        if node.Name == "Characters" then return true end
+        node = node.Parent
+    end
+    return false
+end
+
+-- ============================================================
+--  1) Module Dump  — ดึงข้อมูลจริงจากโมดูลของเกม
+--  วิธีใช้: กดปุ่ม แล้วอ่านผลใน Console (F9)
+--  ประโยชน์: ได้ชื่อ RemoteEvent / ตาราง config จริง
+--            ทำให้ระบบอื่นแม่นขึ้นโดยไม่ต้องเดา
+-- ============================================================
+local DUMP_MODULES = {
+    "Digging", "Dirt", "Eggs", "GrowingEggs", "EggEvents",
+    "Artifacts", "Market", "Pets", "PetIndex", "Animals",
+    "Progression", "TrainingUpgrades", "Offline", "Admin",
+}
+
+local function logLine(text)
+    print("[Coo Hub] " .. text)
+end
+
+-- แสดงค่าในตารางแบบอ่านง่าย (Instance จะโชว์ Path ให้เลย)
+local function describeTable(source, prefix)
+    local count = 0
+    for key, value in pairs(source) do
+        local kind = typeof(value)
+        if kind == "Instance" then
+            logLine(string.format("%s%s (%s) -> %s", prefix, tostring(key), kind, value:GetFullName()))
+        elseif kind == "function" then
+            logLine(string.format("%s%s (function)", prefix, tostring(key)))
+        elseif kind == "table" then
+            logLine(string.format("%s%s (table, %d ค่า)", prefix, tostring(key), #value))
+        else
+            logLine(string.format("%s%s (%s) = %s", prefix, tostring(key), kind, tostring(value)))
+        end
+
+        count += 1
+        if count >= 80 then break end
+    end
+    return count
+end
+
+-- ดึงชื่อ Remote ทั้งหมดใน ReplicatedStorage
+local function dumpRemotes()
+    logLine("---- Remote ใน ReplicatedStorage ----")
+    local total = 0
+    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+        if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction")
+            or obj:IsA("UnreliableRemoteEvent") then
+            logLine(string.format("   %s  [%s]", obj:GetFullName(), obj.ClassName))
+            total += 1
+            if total >= 150 then break end
+        end
+    end
+    logLine("รวม Remote: " .. tostring(total) .. " รายการ")
+    return total
+end
+
+-- โหลดโมดูลเกมและปริ้นค่าข้างใน
+local function dumpModules()
+    logLine("========== MODULE DUMP ==========")
+    logLine("ผู้เล่น: " .. LocalPlayer.Name)
+    logLine("เกม: " .. tostring(game.PlaceId))
+
+    local playerScripts = LocalPlayer:FindFirstChild("PlayerScripts")
+    if not playerScripts then
+        warn("[Coo Hub] หา PlayerScripts ไม่เจอ")
+        return
+    end
+
+    local loaded, failed = 0, 0
+    for _, moduleName in ipairs(DUMP_MODULES) do
+        local moduleScript = playerScripts:FindFirstChild(moduleName)
+        if moduleScript and moduleScript:IsA("ModuleScript") then
+            local ok, result = pcall(require, moduleScript)
+            if ok and type(result) == "table" then
+                logLine(string.format("--- %s (โหลดสำเร็จ) ---", moduleName))
+                describeTable(result, "    ")
+                loaded += 1
+            else
+                logLine(string.format("--- %s (require ไม่ได้: %s) ---", moduleName, tostring(result)))
+                failed += 1
+            end
+        else
+            logLine("--- " .. moduleName .. " (ไม่พบโมดูล) ---")
+            failed += 1
+        end
+    end
+
+    logLine(string.format("สรุป: สำเร็จ %d | ไม่ได้ %d", loaded, failed))
+    dumpRemotes()
+    logLine("=================================")
+end
+
+-- ============================================================
+--  2) Auto Dig  — ขุดอัตโนมัติ
+--  อ้างอิง remote จริงที่ดักได้จาก Cobalt:
+--    ReplicatedStorage.Dig:FireServer(Vector3 ตำแหน่ง, Vector3 ทิศทาง, nil)
+-- ============================================================
+local Dig = {
+    Enabled      = false,
+    Delay        = 0.2,
+    MaxDistance  = 200,
+    Keyword      = "Wall,Block,Ore,Dirt,Dig,FindBlock",
+    SendTool     = false,
+    LastFire     = 0,
+}
+
+local digRemote = nil
+local digTargets = {}
+local digTargetsAt = 0
+local DIG_RESCAN = 2          -- วินาที ก่อนสแกนหาบล็อกใหม่
+local DIG_MAX_TARGETS = 400
+local SCAN_ITERATION_CAP = 20000   -- เพดานการวน objects กันแมพใหญ่ทำเฟรมตก
+
+local function getDigRemote()
+    if digRemote and digRemote.Parent then return digRemote end
+
+    local direct = ReplicatedStorage:FindFirstChild("Dig")
+    if direct and direct:IsA("RemoteEvent") then
+        digRemote = direct
+        return digRemote
+    end
+
+    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+        if obj:IsA("RemoteEvent") and string.find(string.lower(obj.Name), "dig", 1, true) then
+            digRemote = obj
+            return digRemote
+        end
+    end
+    return nil
+end
+
+local function collectDigTargets()
+    digTargets = {}
+    local keywords = parseKeywords(Dig.Keyword)
+    local visited = 0
+
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        visited += 1
+        if visited > SCAN_ITERATION_CAP then break end
+
+        if obj:IsA("BasePart") and not isPlayerCharacter(obj) then
+            local lower = string.lower(obj.Name)
+            for _, keyword in ipairs(keywords) do
+                if string.find(lower, keyword, 1, true) then
+                    table.insert(digTargets, obj)
+                    break
+                end
+            end
+            if #digTargets >= DIG_MAX_TARGETS then break end
+        end
+    end
+
+    digTargetsAt = os.clock()
+end
+
+local function getNearestDigTarget(origin)
+    if os.clock() - digTargetsAt > DIG_RESCAN then
+        collectDigTargets()
+    end
+
+    local best, bestDistance = nil, math.huge
+    for _, part in ipairs(digTargets) do
+        if part.Parent then
+            local distance = (part.Position - origin).Magnitude
+            if distance < bestDistance and distance <= Dig.MaxDistance then
+                bestDistance, best = distance, part
+            end
+        end
+    end
+    return best
+end
+
+local function fireDigAt(position, direction)
+    local remote = getDigRemote()
+    if not remote then return false end
+
+    local thirdArg = nil
+    if Dig.SendTool then
+        local character = LocalPlayer.Character
+        thirdArg = character and character:FindFirstChildOfClass("Tool") or nil
+    end
+
+    local ok = pcall(function()
+        remote:FireServer(position, direction, thirdArg)
+    end)
+    return ok
+end
+
+local function autoDigStep()
+    local root = getMyRoot()
+    if not root then return end
+
+    local origin = root.Position
+    local target = getNearestDigTarget(origin)
+
+    local position, direction
+    if target then
+        position = target.Position
+        local delta = target.Position - origin
+        delta = Vector3.new(delta.X, 0, delta.Z)      -- ตัดแกน Y กันทิศทางเอียง
+        -- กันเวกเตอร์ยาว 0 (ทำให้ direction กลายเป็น NaN)
+        direction = delta.Magnitude > 0.1 and delta.Unit or Vector3.xAxis
+    else
+        -- ไม่เจอบล็อก: ขุดใต้เท้าตัวเอง
+        position = origin - Vector3.new(0, 3, 0)
+        direction = Vector3.xAxis
+    end
+
+    fireDigAt(position, direction)
+end
+
+-- ============================================================
+--  3) Auto เก็บของ  — เก็บไข่/ของที่ขุดเจอ
+--  อ้างอิง remote ที่ดักได้: ArtifactPickup, DirtEarned
+--  ถ้าเกมไม่มี remote ให้เปิด "เดินไปเก็บ" แทน
+-- ============================================================
+local Collect = {
+    Enabled      = false,
+    Delay        = 0.15,
+    MaxDistance  = 40,
+    Keyword      = "Artifact,Egg,Dirt,Coin,Relic",
+    CallStyle    = "ตำแหน่ง + ชื่อ",
+    WalkTo       = false,
+    LastRun      = 0,
+}
+
+local collectRemote = nil
+local collectTargets = {}
+local collectTargetsAt = 0
+local collectCooldown = {}    -- [part] = เวลาที่เพิ่งเก็บไป
+local COLLECT_RESCAN = 1.5
+local COLLECT_MAX_TARGETS = 200
+local COLLECT_COOLDOWN = 4    -- กันยิงซ้ำชิ้นเดิมรัว ๆ
+
+local function getCollectRemote()
+    if collectRemote and collectRemote.Parent then return collectRemote end
+
+    local directNames = { "ArtifactPickup", "Pickup", "CollectDirt", "CollectItem" }
+    for _, name in ipairs(directNames) do
+        local found = ReplicatedStorage:FindFirstChild(name)
+        if found and found:IsA("RemoteEvent") then
+            collectRemote = found
+            return collectRemote
+        end
+    end
+
+    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+        if obj:IsA("RemoteEvent") then
+            local lower = string.lower(obj.Name)
+            if string.find(lower, "artifact", 1, true)
+                or string.find(lower, "pickup", 1, true)
+                or string.find(lower, "collect", 1, true) then
+                collectRemote = obj
+                return collectRemote
+            end
+        end
+    end
+    return nil
+end
+
+local function fireCollect(part)
+    local remote = getCollectRemote()
+    if not remote then return false end
+
+    local style = Collect.CallStyle
+    local ok = pcall(function()
+        if style == "ตำแหน่ง" then
+            remote:FireServer(part.Position)
+        elseif style == "ชื่อ" then
+            remote:FireServer(part.Name)
+        elseif style == "ชิ้นส่วน" then
+            remote:FireServer(part)
+        else
+            remote:FireServer(part.Position, part.Name)
+        end
+    end)
+    return ok
+end
+
+local function collectItems()
+    collectTargets = {}
+    local keywords = parseKeywords(Collect.Keyword)
+    local root = getMyRoot()
+    if not root then return end
+
+    local visited = 0
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        visited += 1
+        if visited > SCAN_ITERATION_CAP then break end
+
+        if obj:IsA("BasePart") and not isPlayerCharacter(obj) then
+            local lower = string.lower(obj.Name)
+            for _, keyword in ipairs(keywords) do
+                if string.find(lower, keyword, 1, true) then
+                    local distance = (obj.Position - root.Position).Magnitude
+                    if distance <= Collect.MaxDistance then
+                        table.insert(collectTargets, obj)
+                    end
+                    break
+                end
+            end
+            if #collectTargets >= COLLECT_MAX_TARGETS then break end
+        end
+    end
+
+    collectTargetsAt = os.clock()
+end
+
+local function autoCollectStep()
+    local root = getMyRoot()
+    if not root then return end
+
+    if os.clock() - collectTargetsAt > COLLECT_RESCAN then
+        collectItems()
+    end
+
+    -- เคลียร์รายการที่ถูกเก็บไปแล้ว
+    local now = os.clock()
+    for part in pairs(collectCooldown) do
+        if not part.Parent or now - collectCooldown[part] > COLLECT_COOLDOWN then
+            collectCooldown[part] = nil
+        end
+    end
+
+    local best, bestDistance = nil, math.huge
+    for _, part in ipairs(collectTargets) do
+        if part.Parent and not collectCooldown[part] then
+            local distance = (part.Position - root.Position).Magnitude
+            if distance < bestDistance then
+                bestDistance, best = distance, part
+            end
+        end
+    end
+
+    if not best then return end
+    collectCooldown[best] = now
+
+    if Collect.WalkTo then
+        local humanoid = LocalPlayer.Character
+            and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if humanoid then
+            pcall(function() humanoid:MoveTo(best.Position) end)
+        end
+    else
+        fireCollect(best)
+    end
+end
+
+-- ============================================================
+--  4) ESP ไข่ / ของหายาก  — สแกนตามชื่อ (ไม่ต้องใช้ Tag)
+--  ต่างจาก "ตัวค้นหาแอดมิน" ตรงที่ใช้ได้กับผู้เล่นทั่วไป
+--  เพราะค้นหาจากชื่อชิ้นส่วนใน Workspace แทน Tag
+-- ============================================================
+local RareFinder = {
+    Enabled      = false,
+    Keyword      = "Egg,Artifact,Ore,Gem,Crystal,Relic",
+    MaxDistance  = 0,                     -- 0 = ไม่จำกัด
+    Refresh      = 1,
+    Color        = Color3.fromRGB(255, 130, 255),
+    LastScan     = 0,
+}
+
+local rareMarkers = {}
+local RARE_MAX_TARGETS = 250
+
+local function removeRareMarker(instance)
+    local marker = rareMarkers[instance]
+    if not marker then return end
+    if marker.highlight then pcall(function() marker.highlight:Destroy() end) end
+    if marker.billboard then pcall(function() marker.billboard:Destroy() end) end
+    rareMarkers[instance] = nil
+end
+
+local function clearRareMarkers()
+    for instance in pairs(rareMarkers) do
+        removeRareMarker(instance)
+    end
+end
+
+local function addRareMarker(instance)
+    if rareMarkers[instance] or not instance:IsDescendantOf(workspace) then return end
+
+    local part = getFinderPart(instance)
+    if not part then return end
+
+    local color = RareFinder.Color
+
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "CooHubRareHighlight"
+    highlight.Adornee = (instance:IsA("Model") or instance:IsA("BasePart")) and instance or part
+    highlight.FillColor = color
+    highlight.FillTransparency = 0.6
+    highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+    highlight.OutlineTransparency = 0
+    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.Parent = instance
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "CooHubRareLabel"
+    billboard.Adornee = part
+    billboard.AlwaysOnTop = true
+    billboard.MaxDistance = 3000
+    billboard.Size = UDim2.fromOffset(200, 40)
+    billboard.StudsOffsetWorldSpace = Vector3.new(0, 3, 0)
+    billboard.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+    local label = Instance.new("TextLabel")
+    label.Name = "Label"
+    label.BackgroundColor3 = Color3.fromRGB(15, 15, 18)
+    label.BackgroundTransparency = 0.2
+    label.BorderSizePixel = 0
+    label.Size = UDim2.fromScale(1, 1)
+    label.Font = Enum.Font.GothamBold
+    label.TextColor3 = color
+    label.TextScaled = true
+    label.TextStrokeTransparency = 0.45
+    label.Parent = billboard
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = label
+
+    rareMarkers[instance] = {
+        highlight = highlight,
+        billboard = billboard,
+        label = label,
+        part = part,
+    }
+end
+
+local function refreshRareMarkers(force)
+    if not RareFinder.Enabled and not force then return end
+
+    local keywords = parseKeywords(RareFinder.Keyword)
+    local foundNow = {}
+    local count = 0
+    local visited = 0
+
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        visited += 1
+        if visited > SCAN_ITERATION_CAP then break end
+
+        if obj:IsA("BasePart") and not isPlayerCharacter(obj) then
+            local lower = string.lower(obj.Name)
+            for _, keyword in ipairs(keywords) do
+                if string.find(lower, keyword, 1, true) then
+                    foundNow[obj] = true
+                    addRareMarker(obj)
+                    count += 1
+                    break
+                end
+            end
+            if count >= RARE_MAX_TARGETS then break end
+        end
+    end
+
+    for instance in pairs(rareMarkers) do
+        if not foundNow[instance] or not instance.Parent then
+            removeRareMarker(instance)
+        end
+    end
+
+    RareFinder.LastScan = os.clock()
+end
+
+local function updateRareDistances()
+    local root = getMyRoot()
+    if not root then return end
+
+    for instance, marker in pairs(rareMarkers) do
+        if not instance.Parent or not marker.part or not marker.part.Parent then
+            removeRareMarker(instance)
+        else
+            local distance = (root.Position - marker.part.Position).Magnitude
+
+            if RareFinder.MaxDistance > 0 and distance > RareFinder.MaxDistance then
+                marker.highlight.Enabled = false
+                marker.billboard.Enabled = false
+            else
+                marker.highlight.Enabled = true
+                marker.billboard.Enabled = true
+                marker.label.Text = string.format("%s  •  %.0f เมตร", instance.Name, distance)
+            end
+        end
+    end
+end
+
+-- ============================================================
+--  Heartbeat รวมของระบบขุด/เก็บ/ESP
+-- ============================================================
+local farmElapsed = 0
+addConnection(RunService.Heartbeat:Connect(function(deltaTime)
+    local now = os.clock()
+
+    -- Auto Dig
+    if Dig.Enabled and now - Dig.LastFire >= Dig.Delay then
+        Dig.LastFire = now
+        autoDigStep()
+    end
+
+    -- Auto เก็บของ
+    if Collect.Enabled and now - Collect.LastRun >= Collect.Delay then
+        Collect.LastRun = now
+        autoCollectStep()
+    end
+
+    -- ESP ของหายาก (สแกนไม่ถี่เกินไป กันเกมหน่วง)
+    farmElapsed += deltaTime
+    if RareFinder.Enabled and farmElapsed >= 0.35 then
+        farmElapsed = 0
+        if now - RareFinder.LastScan > RareFinder.Refresh then
+            refreshRareMarkers()
+        end
+        updateRareDistances()
+    end
+end))
+
+-- ============================================================
 --  Window
 -- ============================================================
 local Window = Rayfield:CreateWindow({
-   Name = "Coo hub V2.1",
+   Name = "Coo hub V3.0",
    LoadingTitle = "Coo OT",
    LoadingSubtitle = "สร้างโดย COOHUB",
    ConfigurationSaving = {
@@ -458,14 +1014,319 @@ MainTab:CreateSection("ข้อมูล")
 
 MainTab:CreateParagraph({
    Title = "เวอร์ชัน",
-   Content = "Coo Hub V2.1 (Admin Fly)",
+   Content = "Coo Hub V3.0 (ขุด + เก็บไข่)",
 })
 
 MainTab:CreateSection("ประกาศ")
 
 MainTab:CreateParagraph({
    Title = "แจ้งให้ทราบ",
-   Content = "ปิดระบบบินก่อนรีเซ็ตตัวละครเพื่อให้ควบคุมได้ปกติ",
+   Content = "ปิดระบบบินก่อนรีเซ็ตตัวละครเพื่อให้ควบคุมได้ปกติ\nถ้าระบบขุด/เก็บของไม่ทำงาน ให้กด Module Dump ในแท็บ \"เครื่องมือ\" แล้วส่งผลใน F9 ให้แอดมิน",
+})
+
+-- ============================================================
+--  TAB: ขุดอัตโนมัติ
+-- ============================================================
+local FarmTab = Window:CreateTab("ขุดอัตโนมัติ", nil)
+FarmTab:CreateSection("Auto Dig (ขุดเอง)")
+
+FarmTab:CreateParagraph({
+   Title = "วิธีใช้",
+   Content = "เปิดแล้วตัวละครจะขุดบล็อกใกล้ตัวอัตโนมัติ\nถ้าหาไม่เจอ จะขุดใต้เท้าตัวเองแทน\nถ้าระบบไม่ทำงาน ให้ปรับ \"คำค้นบล็อก\" ให้ตรงกับชื่อในเกม",
+})
+
+FarmTab:CreateToggle({
+   Name = "เปิด Auto Dig",
+   CurrentValue = false,
+   Flag = "CooHubAutoDig",
+   Callback = function(value)
+      Dig.Enabled = value
+      Dig.LastFire = 0
+      if value then collectDigTargets() end
+   end,
+})
+
+FarmTab:CreateSlider({
+   Name = "ความเร็วในการขุด",
+   Range = {0.05, 2},
+   Increment = 0.05,
+   Suffix = "s",
+   CurrentValue = 0.2,
+   Flag = "CooHubAutoDigDelay",
+   Callback = function(value)
+      Dig.Delay = value
+   end,
+})
+
+FarmTab:CreateSlider({
+   Name = "ระยะห่างบล็อกสูงสุด",
+   Range = {10, 500},
+   Increment = 10,
+   Suffix = " studs",
+   CurrentValue = 200,
+   Flag = "CooHubAutoDigDistance",
+   Callback = function(value)
+      Dig.MaxDistance = value
+   end,
+})
+
+FarmTab:CreateInput({
+   Name = "คำค้นบล็อก (คั่นด้วย , )",
+   CurrentValue = "Wall,Block,Ore,Dirt,Dig,FindBlock",
+   PlaceholderText = "Wall, Block, Ore",
+   RemoveTextAfterFocusLost = false,
+   Flag = "CooHubAutoDigKeyword",
+   Callback = function(text)
+      if text and text ~= "" then
+         Dig.Keyword = text
+         collectDigTargets()
+      end
+   end,
+})
+
+FarmTab:CreateToggle({
+   Name = "ส่ง Tool ไปด้วย (argument ที่ 3)",
+   CurrentValue = false,
+   Flag = "CooHubAutoDigSendTool",
+   Callback = function(value)
+      Dig.SendTool = value
+   end,
+})
+
+FarmTab:CreateButton({
+   Name = "ขุดตรงนี้เลย (ทดสอบ 1 ครั้ง)",
+   Callback = function()
+      autoDigStep()
+      Rayfield:Notify({
+         Title = "Coo Hub",
+         Content = "ยิง remote ขุดแล้ว (ถ้าไม่เกิดอะไร = ยังไม่เจอบล็อก)",
+         Duration = 3,
+      })
+   end,
+})
+
+FarmTab:CreateSection("Auto เก็บของ")
+
+FarmTab:CreateToggle({
+   Name = "เปิด Auto เก็บของ",
+   CurrentValue = false,
+   Flag = "CooHubAutoCollect",
+   Callback = function(value)
+      Collect.Enabled = value
+      Collect.LastRun = 0
+      collectCooldown = {}
+      if value then collectItems() end
+   end,
+})
+
+FarmTab:CreateSlider({
+   Name = "ความเร็วในการเก็บ",
+   Range = {0.05, 2},
+   Increment = 0.05,
+   Suffix = "s",
+   CurrentValue = 0.15,
+   Flag = "CooHubAutoCollectDelay",
+   Callback = function(value)
+      Collect.Delay = value
+   end,
+})
+
+FarmTab:CreateSlider({
+   Name = "ระยะเก็บสูงสุด",
+   Range = {5, 200},
+   Increment = 5,
+   Suffix = " studs",
+   CurrentValue = 40,
+   Flag = "CooHubAutoCollectDistance",
+   Callback = function(value)
+      Collect.MaxDistance = value
+   end,
+})
+
+FarmTab:CreateInput({
+   Name = "คำค้นของที่จะเก็บ (คั่นด้วย , )",
+   CurrentValue = "Artifact,Egg,Dirt,Coin,Relic",
+   PlaceholderText = "Artifact, Egg, Dirt",
+   RemoveTextAfterFocusLost = false,
+   Flag = "CooHubAutoCollectKeyword",
+   Callback = function(text)
+      if text and text ~= "" then
+         Collect.Keyword = text
+         collectItems()
+      end
+   end,
+})
+
+FarmTab:CreateDropdown({
+   Name = "รูปแบบการกดเก็บ",
+   Options = { "ตำแหน่ง + ชื่อ", "ตำแหน่ง", "ชื่อ", "ชิ้นส่วน" },
+   CurrentOption = { "ตำแหน่ง + ชื่อ" },
+   Flag = "CooHubAutoCollectStyle",
+   Callback = function(option)
+      Collect.CallStyle = type(option) == "table" and option[1] or option
+   end,
+})
+
+FarmTab:CreateToggle({
+   Name = "เดินไปเก็บเอง (ใช้เมื่อไม่มี remote)",
+   CurrentValue = false,
+   Flag = "CooHubAutoCollectWalk",
+   Callback = function(value)
+      Collect.WalkTo = value
+   end,
+})
+
+-- ============================================================
+--  TAB: หาไข่ / ของหายาก
+-- ============================================================
+local RareTab = Window:CreateTab("หาไข่/ของหายาก", nil)
+RareTab:CreateSection("ESP ของหายาก")
+
+RareTab:CreateParagraph({
+   Title = "หลักการ",
+   Content = "ต่างจาก \"ตัวค้นหาแอดมิน\" ตรงที่ใช้ได้กับผู้เล่นทั่วไป\nเพราะค้นหาจากชื่อชิ้นส่วนใน Workspace แทน Tag\nถ้าไม่เจอของ ให้ใส่ชื่อของใน \"คำค้น\" ให้ตรง",
+})
+
+RareTab:CreateToggle({
+   Name = "เปิด ESP ของหายาก",
+   CurrentValue = false,
+   Flag = "CooHubRareFinder",
+   Callback = function(value)
+      RareFinder.Enabled = value
+      RareFinder.LastScan = 0
+      if value then
+         refreshRareMarkers()
+      else
+         clearRareMarkers()
+      end
+   end,
+})
+
+RareTab:CreateInput({
+   Name = "คำค้น (คั่นด้วย , )",
+   CurrentValue = "Egg,Artifact,Ore,Gem,Crystal,Relic",
+   PlaceholderText = "Egg, Artifact, Gem",
+   RemoveTextAfterFocusLost = false,
+   Flag = "CooHubRareKeyword",
+   Callback = function(text)
+      if text and text ~= "" then
+         RareFinder.Keyword = text
+         if RareFinder.Enabled then
+            clearRareMarkers()
+            refreshRareMarkers()
+         end
+      end
+   end,
+})
+
+RareTab:CreateSlider({
+   Name = "ระยะสูงสุดที่แสดง",
+   Range = {0, 3000},
+   Increment = 50,
+   Suffix = " studs (0 = ทั้งหมด)",
+   CurrentValue = 0,
+   Flag = "CooHubRareDistance",
+   Callback = function(value)
+      RareFinder.MaxDistance = value
+   end,
+})
+
+RareTab:CreateSlider({
+   Name = "รอบการสแกน",
+   Range = {0.5, 5},
+   Increment = 0.5,
+   Suffix = "s",
+   CurrentValue = 1,
+   Flag = "CooHubRareRefresh",
+   Callback = function(value)
+      RareFinder.Refresh = value
+   end,
+})
+
+RareTab:CreateButton({
+   Name = "สแกนใหม่เดี๋ยวนี้",
+   Callback = function()
+      clearRareMarkers()
+      refreshRareMarkers(true)
+      Rayfield:Notify({
+         Title = "Coo Hub",
+         Content = string.format("สแกนเสร็จ • เจอ %d ชิ้น", (function()
+            local count = 0
+            for _ in pairs(rareMarkers) do count += 1 end
+            return count
+         end)()),
+         Duration = 5,
+      })
+   end,
+})
+
+-- ============================================================
+--  TAB: เครื่องมือ
+-- ============================================================
+local ToolTab = Window:CreateTab("เครื่องมือ", nil)
+ToolTab:CreateSection("Module Dump (ดึงข้อมูลเกม)")
+
+ToolTab:CreateParagraph({
+   Title = "ทำไมต้องมี",
+   Content = "เกมนี้แบ่งระบบเป็นโมดูล (Digging, Eggs, Pets, Artifacts...)\nการดึงข้อมูลจริงจากโมดูล ทำให้รู้ชื่อ RemoteEvent และค่า config จริง\nแทนที่จะต้องเดา แล้วนำไปปรับระบบขุด/เก็บของให้ตรง",
+})
+
+ToolTab:CreateButton({
+   Name = "ดึงข้อมูลโมดูลทั้งหมด (ดูผลที่ F9)",
+   Callback = function()
+      dumpModules()
+      Rayfield:Notify({
+         Title = "Coo Hub",
+         Content = "ดึงข้อมูลแล้ว • กด F9 เพื่อดูผลลัพธ์ใน Console",
+         Duration = 6,
+      })
+   end,
+})
+
+ToolTab:CreateButton({
+   Name = "แสดง Remote ทั้งหมดใน ReplicatedStorage",
+   Callback = function()
+      local total = dumpRemotes()
+      Rayfield:Notify({
+         Title = "Coo Hub",
+         Content = string.format("เจอ Remote %d รายการ • ดูผลที่ F9", total),
+         Duration = 5,
+      })
+   end,
+})
+
+ToolTab:CreateSection("สถานะระบบ")
+
+ToolTab:CreateButton({
+   Name = "ตรวจสอบสถานะ (Diagnostics)",
+   Callback = function()
+      logLine("========== สถานะระบบ ==========")
+      logLine("ตัวละครตัวเอง: " .. (getMyRoot() and "พร้อม" or "ไม่พร้อม"))
+
+      local digFound = getDigRemote()
+      logLine("remote ขุด (Dig): " .. (digFound and digFound:GetFullName() or "ไม่เจอ"))
+
+      local collectFound = getCollectRemote()
+      logLine("remote เก็บของ: " .. (collectFound and collectFound:GetFullName() or "ไม่เจอ"))
+
+      logLine(string.format("บล็อกที่ขุดได้ (แคช): %d ชิ้น", #digTargets))
+      logLine(string.format("ของที่เก็บได้ (แคช): %d ชิ้น", #collectTargets))
+
+      local rareCount = 0
+      for _ in pairs(rareMarkers) do rareCount += 1 end
+      logLine(string.format("ของหายากที่ทำเครื่องหมายไว้: %d ชิ้น", rareCount))
+      logLine("===============================")
+
+      Rayfield:Notify({
+         Title = "Coo Hub - สถานะระบบ",
+         Content = string.format(
+            "remote ขุด: %s\nremote เก็บของ: %s\nบล็อกที่เจอ: %d\n(ดูรายละเอียดที่ F9)",
+            digFound and "เจอ" or "ไม่เจอ",
+            collectFound and "เจอ" or "ไม่เจอ",
+            #digTargets),
+         Duration = 8,
+      })
+   end,
 })
 
 -- ============================================================
@@ -473,6 +1334,16 @@ MainTab:CreateParagraph({
 -- ============================================================
 getgenv().CooHubUnload = function()
     stopFly()
+
+    -- หยุดระบบขุด/เก็บ/ESP ของหายาก
+    Dig.Enabled = false
+    Collect.Enabled = false
+    RareFinder.Enabled = false
+    table.clear(digTargets)
+    table.clear(collectTargets)
+    table.clear(collectCooldown)
+    clearRareMarkers()
+
     finderStates.GoodItem = false
     finderStates.GoodEgg = false
     clearFinderMarkers("GoodItem")
