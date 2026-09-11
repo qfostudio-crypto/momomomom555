@@ -1,0 +1,1265 @@
+-- ============================================================
+--  Coo Hub V1.3  |  Universal Roblox Script
+--  ออกแบบให้ทำงานแบบ generic ใช้ได้กับหลายแมพ
+-- ============================================================
+
+-- กันรันซ้ำ: ถ้าโหลดอยู่แล้วให้ปิดของเก่าก่อน
+if getgenv().CooHubLoaded and getgenv().CooHubUnload then
+    pcall(getgenv().CooHubUnload)
+end
+getgenv().CooHubLoaded = true
+
+-- โหลด UI Library (มี pcall กันพังทั้งสคริปต์)
+local Rayfield
+do
+    local ok, res = pcall(function()
+        return loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+    end)
+    if not ok or not res then
+        warn("[Coo Hub] โหลด Rayfield ไม่สำเร็จ: " .. tostring(res))
+        getgenv().CooHubLoaded = false
+        return
+    end
+    Rayfield = res
+end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local LocalPlayer = Players.LocalPlayer
+
+-- เก็บ connection ทั้งหมดไว้ที่เดียว เพื่อ unload ได้สะอาด
+local connections = {}
+local function addConnection(conn)
+    table.insert(connections, conn)
+    return conn
+end
+
+local Window = Rayfield:CreateWindow({
+   Name = "Coo hub V1.3",
+   LoadingTitle = "Coo OT",
+   LoadingSubtitle = "สร้างโดย COOHUB",
+   ConfigurationSaving = {
+      Enabled = false,
+      FolderName = nil,
+      FileName = "W"
+   }
+})
+
+local MainTab = Window:CreateTab("หน้าหลัก", nil)
+local MainSection = MainTab:CreateSection("เมนูหลัก")
+
+local KillAuraTab = Window:CreateTab("Kill Aura", nil)
+local KillAuraSection = KillAuraTab:CreateSection("ระบบโจมตีอัตโนมัติ")
+
+-- ---- State ----
+local SpeedEnabled = false
+local SpeedValue = 16
+local DefaultWalkSpeed = 16
+local VerticalSpeed = 0
+local IsFlying = false
+local IsFrozen = false
+local FrozenPosition = nil
+
+local ESPEnabled = false
+local ESPData = {}          -- [player] = {box, nameLabel, ...}
+local ESPConnections = {}   -- connection ของระบบ ESP แยกออกมา
+
+local KillAuraEnabled = false
+local KillAuraRange = 15
+local KillAuraDelay = 0.1
+local KillAuraTeleport = false
+local KillAuraLastAttack = 0
+local KillAuraTeamCheck = true
+
+local function getRoot()
+    local char = LocalPlayer.Character
+    if not char then return nil, nil end
+    return char, char:FindFirstChild("HumanoidRootPart")
+end
+
+local function updateSpeed()
+    if not SpeedEnabled then return end
+    local char, rootPart = getRoot()
+    if not char or not rootPart then return end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return end
+
+    if IsFrozen and FrozenPosition then
+        rootPart.CFrame = FrozenPosition
+        return
+    end
+
+    -- วิ่ง: ใช้ WalkSpeed (เสถียรและไม่ชนฟิสิกส์ของเกม)
+    humanoid.WalkSpeed = SpeedValue
+end
+
+-- บินแนวตั้ง: ใช้ deltaTime จาก Heartbeat โดยตรง (ไม่ yield ซ้อนในลูป)
+local function updateFly(dt)
+    if not SpeedEnabled or not IsFlying or IsFrozen or VerticalSpeed == 0 then return end
+    local char, rootPart = getRoot()
+    if not char or not rootPart then return end
+    rootPart.CFrame = rootPart.CFrame + Vector3.new(0, VerticalSpeed * dt, 0)
+end
+
+local function isEnemy(player)
+    if player == LocalPlayer then return false end
+    if not KillAuraTeamCheck then return true end
+    if player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team then
+        return false
+    end
+    return true
+end
+
+local function getNearestEnemy(range)
+    local _, rootPart = getRoot()
+    if not rootPart then return nil end
+
+    local closestPlayer, closestDistance = nil, range
+    for _, player in ipairs(Players:GetPlayers()) do
+        if isEnemy(player) then
+            local char = player.Character
+            if char then
+                local hrp = char:FindFirstChild("HumanoidRootPart")
+                local hum = char:FindFirstChildOfClass("Humanoid")
+                if hrp and hum and hum.Health > 0 then
+                    local dist = (hrp.Position - rootPart.Position).Magnitude
+                    if dist < closestDistance then
+                        closestDistance = dist
+                        closestPlayer = player
+                    end
+                end
+            end
+        end
+    end
+    return closestPlayer
+end
+
+local function updateKillAura()
+    local char, rootPart = getRoot()
+    if not char or not rootPart then return end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return end
+
+    local target = getNearestEnemy(KillAuraRange)
+    if not target or not target.Character then return end
+    local targetRoot = target.Character:FindFirstChild("HumanoidRootPart")
+    if not targetRoot then return end
+
+    local myPos = rootPart.Position
+
+    if KillAuraTeleport then
+        local dest = targetRoot.Position + Vector3.new(0, 2, 0)
+        pcall(function() rootPart.CFrame = CFrame.new(dest) end)
+        myPos = dest
+    end
+
+    -- หันหน้าเข้าหาศัตรู (กันเวกเตอร์ยาว 0 ทำให้ CFrame กลายเป็น NaN)
+    local flatDir = Vector3.new(targetRoot.Position.X - myPos.X, 0, targetRoot.Position.Z - myPos.Z)
+    if flatDir.Magnitude > 0.1 then
+        pcall(function()
+            rootPart.CFrame = CFrame.new(rootPart.Position, rootPart.Position + flatDir)
+        end)
+    end
+
+    -- หา Tool: ถ้าถืออยู่ใช้เลย ไม่งั้นหยิบจาก Backpack
+    local tool = char:FindFirstChildOfClass("Tool")
+    if not tool then
+        local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+        if backpack then
+            for _, item in ipairs(backpack:GetChildren()) do
+                if item:IsA("Tool") then
+                    pcall(function() humanoid:EquipTool(item) end)
+                    tool = item
+                    break
+                end
+            end
+        end
+    end
+
+    if tool and tool:IsA("Tool") then
+        pcall(function() tool:Activate() end)
+    else
+        humanoid:MoveTo(targetRoot.Position)
+    end
+end
+
+addConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if not SpeedEnabled or gameProcessed then return end
+    local char, rootPart = getRoot()
+    if not char or not rootPart then return end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+
+    if input.KeyCode == Enum.KeyCode.Space then
+        if not IsFrozen then
+            VerticalSpeed = SpeedValue
+            IsFlying = true
+        end
+    elseif input.KeyCode == Enum.KeyCode.LeftControl then
+        if not IsFrozen then
+            VerticalSpeed = -SpeedValue
+            IsFlying = true
+        end
+    elseif input.KeyCode == Enum.KeyCode.T then
+        IsFrozen = not IsFrozen
+        if humanoid then
+            if IsFrozen then
+                FrozenPosition = rootPart.CFrame
+                humanoid.WalkSpeed = 0
+                VerticalSpeed = 0
+                IsFlying = false
+            else
+                FrozenPosition = nil
+                humanoid.WalkSpeed = SpeedValue
+            end
+        end
+    end
+end))
+
+addConnection(UserInputService.InputEnded:Connect(function(input)
+    if input.KeyCode == Enum.KeyCode.Space or input.KeyCode == Enum.KeyCode.LeftControl then
+        VerticalSpeed = 0
+        IsFlying = false
+    end
+end))
+
+local removeESP
+
+local function createESP(player)
+    if player == LocalPlayer then return end
+    if ESPData[player] then removeESP(player) end
+
+    local box = Drawing.new("Square")
+    box.Visible = false
+    box.Color = Color3.fromRGB(255, 0, 0)
+    box.Thickness = 1
+    box.Transparency = 1
+    box.Filled = false
+
+    local nameLabel = Drawing.new("Text")
+    nameLabel.Visible = false
+    nameLabel.Color = Color3.fromRGB(255, 255, 255)
+    nameLabel.Size = 16
+    nameLabel.Center = true
+    nameLabel.Outline = true
+    nameLabel.OutlineColor = Color3.fromRGB(0, 0, 0)
+    nameLabel.Font = 3
+
+    local healthBarBg = Drawing.new("Square")
+    healthBarBg.Visible = false
+    healthBarBg.Color = Color3.fromRGB(0, 0, 0)
+    healthBarBg.Thickness = 1
+    healthBarBg.Transparency = 0.5
+    healthBarBg.Filled = true
+
+    local healthBar = Drawing.new("Square")
+    healthBar.Visible = false
+    healthBar.Color = Color3.fromRGB(0, 255, 0)
+    healthBar.Thickness = 1
+    healthBar.Transparency = 1
+    healthBar.Filled = true
+
+    local toolLabel = Drawing.new("Text")
+    toolLabel.Visible = false
+    toolLabel.Color = Color3.fromRGB(255, 255, 0)
+    toolLabel.Size = 14
+    toolLabel.Center = false
+    toolLabel.Outline = true
+    toolLabel.OutlineColor = Color3.fromRGB(0, 0, 0)
+    toolLabel.Font = 3
+
+    ESPData[player] = {
+        box = box,
+        nameLabel = nameLabel,
+        healthBarBg = healthBarBg,
+        healthBar = healthBar,
+        toolLabel = toolLabel,
+    }
+end
+
+function removeESP(player)
+    local data = ESPData[player]
+    if not data then return end
+    for _, obj in pairs(data) do
+        pcall(function() obj:Remove() end)
+    end
+    ESPData[player] = nil
+end
+
+local function hideESP(data)
+    data.box.Visible = false
+    data.nameLabel.Visible = false
+    data.healthBarBg.Visible = false
+    data.healthBar.Visible = false
+    data.toolLabel.Visible = false
+end
+
+local function updateESP()
+    if not ESPEnabled then return end
+    local camera = Workspace.CurrentCamera
+    if not camera then return end
+
+    for player, data in pairs(ESPData) do
+        local char = player.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+
+        if not (char and hrp and humanoid and player.Parent) then
+            hideESP(data)
+            continue
+        end
+
+        local rootPosOnScreen, onScreen = camera:WorldToViewportPoint(hrp.Position)
+        if not onScreen then
+            hideESP(data)
+            continue
+        end
+
+        local headPart = char:FindFirstChild("Head")
+        local headPos = headPart and headPart.Position or (hrp.Position + Vector3.new(0, 3, 0))
+        local headPosOnScreen = camera:WorldToViewportPoint(headPos)
+
+        local boxSize = Vector2.new(
+            math.max(math.abs(headPosOnScreen.X - rootPosOnScreen.X) * 3, 30),
+            math.abs(headPosOnScreen.Y - rootPosOnScreen.Y) * 1.5
+        )
+        local boxPosition = Vector2.new(
+            rootPosOnScreen.X - boxSize.X / 2,
+            rootPosOnScreen.Y - boxSize.Y / 2
+        )
+
+        data.box.Size = boxSize
+        data.box.Position = boxPosition
+        data.box.Visible = true
+
+        data.nameLabel.Text = player.Name
+        data.nameLabel.Position = Vector2.new(boxPosition.X + boxSize.X / 2, boxPosition.Y - 20)
+        data.nameLabel.Visible = true
+
+        local hbH, hbW = boxSize.Y, 5
+        local hbPos = Vector2.new(boxPosition.X - 10, boxPosition.Y)
+        data.healthBarBg.Size = Vector2.new(hbW, hbH)
+        data.healthBarBg.Position = hbPos
+        data.healthBarBg.Visible = true
+
+        local hpPct = math.clamp(humanoid.Health / math.max(humanoid.MaxHealth, 1), 0, 1)
+        local fillH = hbH * hpPct
+        data.healthBar.Size = Vector2.new(hbW, fillH)
+        data.healthBar.Position = Vector2.new(hbPos.X, hbPos.Y + hbH - fillH)
+        data.healthBar.Visible = true
+        data.healthBar.Color = Color3.fromRGB(
+            math.clamp(255 * (1 - hpPct), 0, 255),
+            math.clamp(255 * hpPct, 0, 255),
+            0
+        )
+
+        local toolsList = {}
+        local equipped = char:FindFirstChildOfClass("Tool")
+        if equipped and equipped.Name ~= "Fists" then
+            table.insert(toolsList, "⚔️ " .. equipped.Name)
+        end
+        local backpack = player:FindFirstChildOfClass("Backpack")
+        if backpack then
+            for _, tool in ipairs(backpack:GetChildren()) do
+                if tool:IsA("Tool") and tool.Name ~= "Fists" then
+                    table.insert(toolsList, "🎒 " .. tool.Name)
+                end
+            end
+        end
+
+        if #toolsList > 0 then
+            data.toolLabel.Text = table.concat(toolsList, "\n")
+            data.toolLabel.Position = Vector2.new(boxPosition.X + boxSize.X + 5, boxPosition.Y)
+            data.toolLabel.Visible = true
+        else
+            data.toolLabel.Visible = false
+        end
+    end
+end
+
+local function disconnectESP()
+    for _, conn in ipairs(ESPConnections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    table.clear(ESPConnections)
+end
+
+local function toggleESP(enabled)
+    ESPEnabled = enabled
+
+    for player in pairs(ESPData) do
+        removeESP(player)
+    end
+
+    if enabled then
+        for _, player in ipairs(Players:GetPlayers()) do
+            createESP(player)
+        end
+
+        table.insert(ESPConnections, Players.PlayerAdded:Connect(function(player)
+            if ESPEnabled then createESP(player) end
+        end))
+        table.insert(ESPConnections, Players.PlayerRemoving:Connect(function(player)
+            removeESP(player)
+        end))
+        table.insert(ESPConnections, RunService.RenderStepped:Connect(updateESP))
+    else
+        disconnectESP()
+        table.clear(ESPData)
+    end
+end
+
+local SpeedToggle = MainTab:CreateToggle({
+   Name = "เปิดระบบวิ่ง/บิน",
+   CurrentValue = false,
+   Flag = "SpeedToggle",
+   Callback = function(Value)
+      SpeedEnabled = Value
+      VerticalSpeed = 0
+      IsFlying = false
+      
+      if not SpeedEnabled then
+         -- รีเซ็ตสถานะแช่แข็ง กันค้าง/เด้งกลับจุดเดิม
+         IsFrozen = false
+         FrozenPosition = nil
+         VerticalSpeed = 0
+         IsFlying = false
+
+         local char = LocalPlayer.Character
+         local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+         if humanoid then
+            humanoid.WalkSpeed = DefaultWalkSpeed
+         end
+      end
+   end,
+})
+
+local ESPToggle = MainTab:CreateToggle({
+   Name = "แสดงตำแหน่งผู้เล่น (ESP)",
+   CurrentValue = false,
+   Flag = "ESPToggle",
+   Callback = function(Value)
+      toggleESP(Value)
+   end,
+})
+
+local SpeedSlider = MainTab:CreateSlider({
+   Name = "ความเร็วในการวิ่ง",
+   Range = {16, 500},
+   Increment = 1,
+   Suffix = "Speed",
+   CurrentValue = 16,
+   Flag = "SpeedSlider",
+   Callback = function(Value)
+      SpeedValue = Value
+   end,
+})
+
+addConnection(RunService.Heartbeat:Connect(function(dt)
+    if SpeedEnabled then
+        updateSpeed()
+        updateFly(dt)
+    end
+end))
+
+addConnection(RunService.Heartbeat:Connect(function()
+    if KillAuraEnabled then
+        local now = os.clock()
+        if now - KillAuraLastAttack >= KillAuraDelay then
+            KillAuraLastAttack = now
+            updateKillAura()
+        end
+    end
+end))
+
+addConnection(LocalPlayer.CharacterAdded:Connect(function(char)
+    -- รีเซ็ตสถานะแช่แข็ง/บินตอนเกิดใหม่ กันเด้งกลับจุดตาย
+    IsFrozen = false
+    FrozenPosition = nil
+    IsFlying = false
+    VerticalSpeed = 0
+
+    task.wait(0.5)
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        DefaultWalkSpeed = humanoid.WalkSpeed
+        if SpeedEnabled then
+            humanoid.WalkSpeed = SpeedValue
+        end
+    end
+end))
+
+local KillAuraToggle = KillAuraTab:CreateToggle({
+   Name = "เปิดระบบ Kill Aura",
+   CurrentValue = false,
+   Flag = "KillAuraToggle",
+   Callback = function(Value)
+      KillAuraEnabled = Value
+   end,
+})
+
+local KillAuraRangeSlider = KillAuraTab:CreateSlider({
+   Name = "ระยะโจมตี",
+   Range = {5, 100},
+   Increment = 5,
+   Suffix = "studs",
+   CurrentValue = 15,
+   Flag = "KillAuraRangeSlider",
+   Callback = function(Value)
+      KillAuraRange = Value
+   end,
+})
+
+local KillAuraDelaySlider = KillAuraTab:CreateSlider({
+   Name = "ความเร็วในการโจมตี",
+   Range = {0.05, 1},
+   Increment = 0.05,
+   Suffix = "s",
+   CurrentValue = 0.1,
+   Flag = "KillAuraDelaySlider",
+   Callback = function(Value)
+      KillAuraDelay = Value
+   end,
+})
+
+local KillAuraTeleportToggle = KillAuraTab:CreateToggle({
+   Name = "เทเลพอร์ตไปหาศัตรู",
+   CurrentValue = false,
+   Flag = "KillAuraTeleportToggle",
+   Callback = function(Value)
+      KillAuraTeleport = Value
+   end,
+})
+
+local KillAuraTeamToggle = KillAuraTab:CreateToggle({
+   Name = "เช็คทีม (ไม่โจมตีพวกเดียวกัน)",
+   CurrentValue = true,
+   Flag = "KillAuraTeamToggle",
+   Callback = function(Value)
+      KillAuraTeamCheck = Value
+   end,
+})
+
+-- ============================================================
+--  ระบบ Auto Dig (ฟาร์มขุดอัตโนมัติ)
+--  อ้างอิงจาก remote ที่ดักได้จาก Cobalt:
+--    ReplicatedStorage.Dig:FireServer(Vector3 ตำแหน่ง, Vector3 ทิศทาง, nil)
+--  หมายเหตุ: argument ของแต่ละเกมอาจไม่เหมือนกัน ให้ปรับผ่านเมนูได้
+-- ============================================================
+
+-- ---- State ----
+local AutoDigEnabled = false
+local AutoDigDelay = 0.2
+local AutoDigLastFire = 0
+local AutoDigSendTool = false          -- ส่ง Tool เป็น argument ที่ 3 (ปกติส่ง nil)
+local AutoDigTargetName = "Wall"       -- ชื่อบล็อกเป้าหมาย (Wall / Block / FindBlock)
+local AutoDigMaxDistance = 200
+
+local digTargets = {}
+local digTargetsCollectedAt = 0
+local DIG_TARGET_REFRESH = 2           -- วินาที ก่อนสแกนหาบล็อกใหม่
+
+local AntiAFKEnabled = false
+local antiAfkConnection = nil
+
+-- หา RemoteEvent ของ Dig (เผื่อชื่อไม่ตรงเป๊ะ)
+local function getDigRemote()
+    local replicated = game:GetService("ReplicatedStorage")
+    local remote = replicated:FindFirstChild("Dig")
+    if remote and remote:IsA("RemoteEvent") then
+        return remote
+    end
+    for _, obj in ipairs(replicated:GetDescendants()) do
+        if obj:IsA("RemoteEvent") and string.find(string.lower(obj.Name), "dig") then
+            return obj
+        end
+    end
+    return nil
+end
+
+-- สแกนหาบล็อกที่ขุดได้ (จำกัดจำนวน กันหน่วง)
+local function collectDigTargets()
+    digTargets = {}
+    local wanted = string.lower(AutoDigTargetName)
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("BasePart") then
+            local name = string.lower(obj.Name)
+            if name == wanted or string.find(name, "block") then
+                table.insert(digTargets, obj)
+                if #digTargets >= 400 then break end
+            end
+        end
+    end
+    digTargetsCollectedAt = os.clock()
+end
+
+local function getNearestDigTarget(origin)
+    if os.clock() - digTargetsCollectedAt > DIG_TARGET_REFRESH then
+        collectDigTargets()
+    end
+
+    local best, bestDist = nil, math.huge
+    for _, part in ipairs(digTargets) do
+        if part.Parent then
+            local dist = (part.Position - origin).Magnitude
+            if dist < bestDist and dist <= AutoDigMaxDistance then
+                bestDist = dist
+                best = part
+            end
+        end
+    end
+    return best
+end
+
+-- ยิง remote Dig
+local function fireDig()
+    local char, rootPart = getRoot()
+    if not char or not rootPart then return end
+
+    local remote = getDigRemote()
+    if not remote then return end
+
+    local origin = rootPart.Position
+    local position, direction
+
+    local target = getNearestDigTarget(origin)
+    if target then
+        position = target.Position
+        local delta = target.Position - origin
+        delta = Vector3.new(delta.X, 0, delta.Z)     -- ตัดแกน Y กันทิศทางเอียง
+        -- กันเวกเตอร์ยาว 0 (ทำให้ direction เป็น NaN)
+        direction = delta.Magnitude > 0.1 and delta.Unit or Vector3.new(1, 0, 0)
+    else
+        -- ไม่เจอบล็อก: ขุดใต้เท้าตัวเอง (fallback)
+        position = origin - Vector3.new(0, 3, 0)
+        direction = Vector3.new(1, 0, 0)
+    end
+
+    local thirdArg = nil
+    if AutoDigSendTool then
+        thirdArg = char:FindFirstChildOfClass("Tool")
+    end
+
+    pcall(function()
+        remote:FireServer(position, direction, thirdArg)
+    end)
+end
+
+-- Anti-AFK: กันถูกเตะตอน AFK (เกมนี้มี remote ชื่อ IdleReconnect)
+local function setAntiAFK(enabled)
+    AntiAFKEnabled = enabled
+    if enabled then
+        if not antiAfkConnection then
+            antiAfkConnection = addConnection(LocalPlayer.Idled:Connect(function()
+                local virtualUser = game:GetService("VirtualUser")
+                pcall(function()
+                    virtualUser:CaptureController()
+                    virtualUser:ClickButton2(Vector2.new())
+                end)
+            end))
+        end
+    elseif antiAfkConnection then
+        pcall(function() antiAfkConnection:Disconnect() end)
+        antiAfkConnection = nil
+    end
+end
+
+-- ---- UI ----
+local AutoFarmTab = Window:CreateTab("ฟาร์มขุด", nil)
+local AutoDigSection = AutoFarmTab:CreateSection("Auto Dig (ขุดอัตโนมัติ)")
+
+AutoFarmTab:CreateParagraph({
+   Title = "วิธีใช้",
+   Content = "เปิด Auto Dig แล้วตัวละครจะยิง remote Dig ไปที่บล็อกใกล้สุดอัตโนมัติ\nถ้าไม่เจอบล็อกจะขุดใต้เท้าตัวเองเป็นค่าเริ่มต้น\nปรับชื่อบล็อกเป้าหมายได้ที่ช่องด้านล่าง (เช่น Wall, Block)",
+})
+
+AutoFarmTab:CreateToggle({
+   Name = "เปิด Auto Dig",
+   CurrentValue = false,
+   Flag = "AutoDigToggle",
+   Callback = function(Value)
+      AutoDigEnabled = Value
+      AutoDigLastFire = 0
+      if Value then
+         collectDigTargets()
+      end
+   end,
+})
+
+AutoFarmTab:CreateSlider({
+   Name = "ความเร็วในการขุด",
+   Range = {0.05, 2},
+   Increment = 0.05,
+   Suffix = "s",
+   CurrentValue = 0.2,
+   Flag = "AutoDigDelaySlider",
+   Callback = function(Value)
+      AutoDigDelay = Value
+   end,
+})
+
+AutoFarmTab:CreateSlider({
+   Name = "ระยะห่างบล็อกสูงสุด",
+   Range = {10, 500},
+   Increment = 10,
+   Suffix = "studs",
+   CurrentValue = 200,
+   Flag = "AutoDigDistanceSlider",
+   Callback = function(Value)
+      AutoDigMaxDistance = Value
+   end,
+})
+
+AutoFarmTab:CreateInput({
+   Name = "ชื่อบล็อกเป้าหมาย",
+   CurrentValue = "Wall",
+   PlaceholderText = "Wall / Block / FindBlock",
+   RemoveTextAfterFocusLost = false,
+   Flag = "AutoDigTargetInput",
+   Callback = function(Text)
+      if Text and Text ~= "" then
+         AutoDigTargetName = Text
+         collectDigTargets()
+      end
+   end,
+})
+
+AutoFarmTab:CreateToggle({
+   Name = "ส่ง Tool ไปด้วย (argument ที่ 3)",
+   CurrentValue = false,
+   Flag = "AutoDigSendToolToggle",
+   Callback = function(Value)
+      AutoDigSendTool = Value
+   end,
+})
+
+AutoFarmTab:CreateButton({
+   Name = "ขุดตรงนี้เลย (ทดสอบ)",
+   Callback = function()
+      fireDig()
+   end,
+})
+
+local UtilitySection = AutoFarmTab:CreateSection("ระบบเสริม")
+
+AutoFarmTab:CreateToggle({
+   Name = "กัน AFK (Anti-Idle)",
+   CurrentValue = false,
+   Flag = "AntiAFKToggle",
+   Callback = function(Value)
+      setAntiAFK(Value)
+   end,
+})
+
+-- ---- Loop ----
+addConnection(RunService.Heartbeat:Connect(function()
+    if not AutoDigEnabled then return end
+    local now = os.clock()
+    if now - AutoDigLastFire < AutoDigDelay then return end
+    AutoDigLastFire = now
+    fireDig()
+end))
+
+-- ============================================================
+--  ระบบวาปหาของหายาก (Artifact Hunter)
+--  ขั้นตอน: สแกนหาของหายาก -> วาปไป -> ขุด -> กดเก็บ (ArtifactPickup)
+--  อ้างอิง remote ที่ดักได้จาก Cobalt:
+--    ReplicatedStorage.ArtifactPickup  (argument มีชื่อของ เช่น "Phoenix Feather")
+--    ReplicatedStorage.Dig:FireServer(Vector3 ตำแหน่ง, Vector3 ทิศทาง, nil)
+--  *** ชื่อ/ระดับความหายากตรวจจับจาก attribute หรือชื่อชิ้นส่วน
+--      ถ้าเกมเก็บข้อมูลไว้ที่อื่น ให้เพิ่มชื่อของในช่อง "ชื่อของเพิ่มเติม" ***
+-- ============================================================
+
+-- ---- State ----
+local AutoHuntEnabled = false
+local TeleportToArtifact = true
+local DigAfterTeleport = true
+local PickupAfterTeleport = true
+local ArtifactHighlightEnabled = false
+local HuntLogEnabled = false
+local ArtifactRarityFilter = { "Rare", "Epic", "Legendary", "Mythic", "Secret", "Unknown" }
+local HuntDelay = 0.5
+local HuntLastAction = 0
+local HighlightLastRefresh = 0
+local PickupCallStyle = "ตำแหน่ง + ชื่อ"
+local HuntExtraNames = {}
+local artifactCache = {}
+local artifactCacheAt = 0
+local artifactHighlights = {}
+local visitedArtifacts = {}          -- [part] = os.clock() เวลาที่เพิ่งเก็บไป
+local lastHuntTarget = nil
+
+local ARTIFACT_REFRESH = 1.5          -- วินาที ก่อนสแกนของใหม่
+local HUNT_VISIT_COOLDOWN = 6         -- วินาที กันยิงซ้ำชิ้นเดิมรัว ๆ
+local HUNT_MAX_SCAN = 200             -- จำนวนชิ้นสูงสุดต่อการสแกน (กันหน่วง)
+
+-- ---- ระดับความหายาก ----
+local RARITY_ORDER = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Secret", "Unknown" }
+
+-- เรียงจากเฉพาะเจาะจง -> กว้าง (สำคัญ: "uncommon" ต้องเช็คก่อน "common")
+local RARITY_MATCH_ORDER = { "Secret", "Mythic", "Legendary", "Epic", "Uncommon", "Rare", "Common" }
+local RARITY_KEYWORDS = {
+    Common    = { "common", "ธรรมดา" },
+    Uncommon  = { "uncommon", "ไม่ธรรมดา" },
+    Rare      = { "rare", "หายาก" },
+    Epic      = { "epic", "มหากาพย์" },
+    Legendary = { "legendary", "legacy", "ตำนาน" },
+    Mythic    = { "mythic", "myth", "เทพ" },
+    Secret    = { "secret", "exotic", "godly", "ลับ" },
+}
+local RARITY_COLORS = {
+    Common    = Color3.fromRGB(185, 185, 185),
+    Uncommon  = Color3.fromRGB(80, 220, 100),
+    Rare      = Color3.fromRGB(70, 140, 255),
+    Epic      = Color3.fromRGB(170, 80, 255),
+    Legendary = Color3.fromRGB(255, 180, 40),
+    Mythic    = Color3.fromRGB(255, 70, 70),
+    Secret    = Color3.fromRGB(0, 255, 230),
+    Unknown   = Color3.fromRGB(255, 255, 255),
+}
+
+local function normalizeRarity(text)
+    if text == nil then return "Unknown" end
+    local s = tostring(text)
+
+    -- กรณีเก็บเป็นตัวเลขระดับ (1 = ธรรมดา, 8 = ลับสุด)
+    local num = tonumber(s)
+    if num then
+        local index = math.clamp(math.floor(num), 1, #RARITY_ORDER)
+        return RARITY_ORDER[index]
+    end
+
+    local lower = string.lower(s)
+    for _, rarity in ipairs(RARITY_MATCH_ORDER) do
+        for _, keyword in ipairs(RARITY_KEYWORDS[rarity]) do
+            if string.find(lower, keyword, 1, true) then
+                return rarity
+            end
+        end
+    end
+    return "Unknown"
+end
+
+local RARITY_ATTRIBUTES = { "Rarity", "RarityName", "RarityTier", "Tier", "Quality", "Grade", "TierName" }
+local function getArtifactRarity(part)
+    for _, attr in ipairs(RARITY_ATTRIBUTES) do
+        local ok, value = pcall(function() return part:GetAttribute(attr) end)
+        if ok and value ~= nil then
+            return normalizeRarity(value)
+        end
+    end
+    return normalizeRarity(part.Name)
+end
+
+local function rarityAllowed(rarity)
+    for _, allowed in ipairs(ArtifactRarityFilter) do
+        if allowed == rarity then return true end
+    end
+    return false
+end
+
+-- ---- ตรวจจับว่าชิ้นส่วนนี้ "ของหายาก" ไหม ----
+local function isArtifact(part)
+    if not part:IsA("BasePart") then return false end
+
+    -- 1) attribute บอกตรง ๆ
+    local ok, flag = pcall(function()
+        return part:GetAttribute("Artifact") or part:GetAttribute("IsArtifact")
+    end)
+    if ok and flag then return true end
+
+    local lower = string.lower(part.Name)
+
+    -- 2) ชื่อมีคำว่า artifact
+    if string.find(lower, "artifact", 1, true) then return true end
+
+    -- 3) ชื่อของที่รู้จัก (จาก Cobalt: "Phoenix Feather")
+    if string.find(lower, "phoenix", 1, true) then return true end
+
+    -- 4) ชื่อที่ผู้ใช้เพิ่มเอง
+    for _, name in ipairs(HuntExtraNames) do
+        if string.find(lower, name, 1, true) then return true end
+    end
+
+    -- 5) อยู่ในโฟลเดอร์ที่ชื่อมีคำว่า artifact
+    local parent = part.Parent
+    for _ = 1, 3 do
+        if not parent then break end
+        if string.find(string.lower(parent.Name), "artifact", 1, true) then
+            return true
+        end
+        parent = parent.Parent
+    end
+
+    return false
+end
+
+-- ---- สแกนหาของหายาก ----
+local function collectArtifacts()
+    artifactCache = {}
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if isArtifact(obj) then
+            table.insert(artifactCache, obj)
+            if #artifactCache >= HUNT_MAX_SCAN then break end
+        end
+    end
+    artifactCacheAt = os.clock()
+end
+
+local function pruneVisited()
+    local alive = 0
+    for part in pairs(visitedArtifacts) do
+        if part.Parent then
+            alive += 1
+        else
+            visitedArtifacts[part] = nil
+        end
+    end
+    if alive > 250 then
+        table.clear(visitedArtifacts)
+    end
+end
+
+local function getNearestArtifact(origin)
+    if os.clock() - artifactCacheAt > ARTIFACT_REFRESH then
+        collectArtifacts()
+    end
+
+    local best, bestDist, bestRarity = nil, math.huge, nil
+    local now = os.clock()
+    for _, part in ipairs(artifactCache) do
+        if part.Parent then
+            local seenAt = visitedArtifacts[part]
+            if not seenAt or now - seenAt > HUNT_VISIT_COOLDOWN then
+                local rarity = getArtifactRarity(part)
+                if rarityAllowed(rarity) then
+                    local dist = (part.Position - origin).Magnitude
+                    if dist < bestDist then
+                        bestDist, best, bestRarity = dist, part, rarity
+                    end
+                end
+            end
+        end
+    end
+    return best, bestRarity, bestDist
+end
+
+-- ---- Remote ของ ArtifactPickup ----
+local function getPickupRemote()
+    local replicated = game:GetService("ReplicatedStorage")
+    local remote = replicated:FindFirstChild("ArtifactPickup")
+    if remote and remote:IsA("RemoteEvent") then return remote end
+
+    for _, obj in ipairs(replicated:GetDescendants()) do
+        if obj:IsA("RemoteEvent") then
+            local name = string.lower(obj.Name)
+            if string.find(name, "artifact", 1, true) or string.find(name, "pickup", 1, true) then
+                return obj
+            end
+        end
+    end
+    return nil
+end
+
+local function firePickup(part)
+    local remote = getPickupRemote()
+    if not remote then return end
+
+    if PickupCallStyle == "ตำแหน่ง" then
+        pcall(function() remote:FireServer(part.Position) end)
+    elseif PickupCallStyle == "ชื่อ" then
+        pcall(function() remote:FireServer(part.Name) end)
+    elseif PickupCallStyle == "ชิ้นส่วน" then
+        pcall(function() remote:FireServer(part) end)
+    else -- ตำแหน่ง + ชื่อ
+        pcall(function() remote:FireServer(part.Position, part.Name) end)
+    end
+end
+
+-- ---- วาป + ขุดตรงตำแหน่งที่กำหนด ----
+local function teleportTo(position)
+    local char, rootPart = getRoot()
+    if not char or not rootPart then return false end
+    local ok = pcall(function()
+        rootPart.CFrame = CFrame.new(position + Vector3.new(0, 3, 0))
+    end)
+    return ok
+end
+
+local function fireDigAtPos(targetPos)
+    local char, rootPart = getRoot()
+    if not char or not rootPart then return end
+
+    local remote = getDigRemote()
+    if not remote then return end
+
+    local delta = targetPos - rootPart.Position
+    delta = Vector3.new(delta.X, 0, delta.Z)              -- ตัดแกน Y กันทิศทางเอียง
+    local direction = delta.Magnitude > 0.1 and delta.Unit or Vector3.new(1, 0, 0)
+
+    pcall(function() remote:FireServer(targetPos, direction, nil) end)
+end
+
+-- ---- ไฮไลต์ของหายาก ----
+local function clearArtifactHighlights()
+    for part, adorn in pairs(artifactHighlights) do
+        pcall(function() adorn:Destroy() end)
+    end
+    table.clear(artifactHighlights)
+end
+
+local function refreshArtifactHighlights()
+    clearArtifactHighlights()
+    if not ArtifactHighlightEnabled then return end
+
+    for _, part in ipairs(artifactCache) do
+        if part.Parent then
+            local adorn = Instance.new("BoxHandleAdornment")
+            adorn.Name = "CooHubArtifactAdorn"
+            adorn.Adornee = part
+            adorn.AlwaysOnTop = true
+            adorn.ZIndex = 5
+            adorn.Transparency = 0.6
+            adorn.Color3 = RARITY_COLORS[getArtifactRarity(part)] or RARITY_COLORS.Unknown
+            adorn.Size = part.Size
+            adorn.Parent = part
+            artifactHighlights[part] = adorn
+        end
+    end
+    HighlightLastRefresh = os.clock()
+end
+
+-- ---- ขั้นตอนหลัก: วาป -> ขุด -> เก็บ ----
+local function huntStep()
+    local char, rootPart = getRoot()
+    if not char or not rootPart then return end
+
+    local target, rarity, dist = getNearestArtifact(rootPart.Position)
+    if not target then return end
+
+    visitedArtifacts[target] = os.clock()      -- ทำเครื่องหมายกันยิงซ้ำ
+    lastHuntTarget = target
+
+    if TeleportToArtifact then
+        teleportTo(target.Position)
+    end
+
+    if DigAfterTeleport then
+        fireDigAtPos(target.Position)
+    end
+
+    if PickupAfterTeleport then
+        firePickup(target)
+    end
+
+    if HuntLogEnabled then
+        print(string.format("[Coo Hub] เจอ %s | ระดับ %s | ห่าง %.0f studs",
+            target.Name, tostring(rarity), dist or 0))
+    end
+end
+
+-- ---- UI ----
+local HuntTab = Window:CreateTab("วาปหาของหายาก", nil)
+local HuntSection = HuntTab:CreateSection("Auto Hunt (วาปหาของ)")
+
+HuntTab:CreateParagraph({
+   Title = "วิธีใช้",
+   Content = "เปิดระบบแล้วตัวละครจะหาของหายากที่ใกล้ที่สุด -> วาปไป -> ขุด -> กดเก็บ ให้อัตโนมัติ\nเลือกได้ว่าจะเอาของระดับไหนบ้างที่ช่อง \"ระดับความหายาก\"\nถ้าเกมใช้ชื่อของแบบพิเศษ ให้พิมพ์ชื่อเพิ่มที่ช่อง \"ชื่อของเพิ่มเติม\" (คั่นด้วย , )",
+})
+
+HuntTab:CreateToggle({
+   Name = "เปิดระบบวาปหาของหายาก",
+   CurrentValue = false,
+   Flag = "AutoHuntToggle",
+   Callback = function(Value)
+      AutoHuntEnabled = Value
+      HuntLastAction = 0
+      if Value then
+         collectArtifacts()
+         if ArtifactHighlightEnabled then refreshArtifactHighlights() end
+      end
+   end,
+})
+
+HuntTab:CreateToggle({
+   Name = "วาปไปหาของ (Teleport)",
+   CurrentValue = true,
+   Flag = "HuntTeleportToggle",
+   Callback = function(Value)
+      TeleportToArtifact = Value
+   end,
+})
+
+HuntTab:CreateToggle({
+   Name = "ขุดทันทีหลังวาป",
+   CurrentValue = true,
+   Flag = "HuntDigToggle",
+   Callback = function(Value)
+      DigAfterTeleport = Value
+   end,
+})
+
+HuntTab:CreateToggle({
+   Name = "กดเก็บของ (ArtifactPickup)",
+   CurrentValue = true,
+   Flag = "HuntPickupToggle",
+   Callback = function(Value)
+      PickupAfterTeleport = Value
+   end,
+})
+
+HuntTab:CreateSlider({
+   Name = "ความเร็วในการหาของ",
+   Range = {0.1, 3},
+   Increment = 0.1,
+   Suffix = "s",
+   CurrentValue = 0.5,
+   Flag = "HuntDelaySlider",
+   Callback = function(Value)
+      HuntDelay = Value
+   end,
+})
+
+HuntTab:CreateDropdown({
+   Name = "ระดับความหายาก",
+   Options = RARITY_ORDER,
+   CurrentOption = { "Rare", "Epic", "Legendary", "Mythic", "Secret", "Unknown" },
+   MultipleOptions = true,
+   Flag = "HuntRarityDropdown",
+   Callback = function(Options)
+      if type(Options) == "table" then
+         ArtifactRarityFilter = Options
+      else
+         ArtifactRarityFilter = { Options }
+      end
+   end,
+})
+
+HuntTab:CreateDropdown({
+   Name = "รูปแบบการกดเก็บ",
+   Options = { "ตำแหน่ง + ชื่อ", "ตำแหน่ง", "ชื่อ", "ชิ้นส่วน" },
+   CurrentOption = "ตำแหน่ง + ชื่อ",
+   Flag = "HuntPickupStyleDropdown",
+   Callback = function(Option)
+      PickupCallStyle = type(Option) == "table" and Option[1] or Option
+   end,
+})
+
+HuntTab:CreateInput({
+   Name = "ชื่อของเพิ่มเติม (คั่นด้วย , )",
+   CurrentValue = "",
+   PlaceholderText = "Phoenix Feather, Golden Relic",
+   RemoveTextAfterFocusLost = false,
+   Flag = "HuntExtraNamesInput",
+   Callback = function(Text)
+      table.clear(HuntExtraNames)
+      if Text and Text ~= "" then
+         for name in string.gmatch(Text, "[^,]+") do
+            local trimmed = string.lower(name):match("^%s*(.-)%s*$")
+            if trimmed ~= "" then
+               table.insert(HuntExtraNames, trimmed)
+            end
+         end
+      end
+      collectArtifacts()
+      if ArtifactHighlightEnabled then refreshArtifactHighlights() end
+   end,
+})
+
+HuntTab:CreateToggle({
+   Name = "แสดงไฮไลต์ของหายาก",
+   CurrentValue = false,
+   Flag = "HuntHighlightToggle",
+   Callback = function(Value)
+      ArtifactHighlightEnabled = Value
+      if Value then
+         collectArtifacts()
+      end
+      refreshArtifactHighlights()
+   end,
+})
+
+HuntTab:CreateToggle({
+   Name = "แสดง log ของที่เจอ",
+   CurrentValue = false,
+   Flag = "HuntLogToggle",
+   Callback = function(Value)
+      HuntLogEnabled = Value
+   end,
+})
+
+HuntTab:CreateButton({
+   Name = "วาปหาชิ้นที่ใกล้สุด (ทดสอบ)",
+   Callback = function()
+      collectArtifacts()
+      huntStep()
+   end,
+})
+
+HuntTab:CreateButton({
+   Name = "สแกนของใหม่ (Refresh)",
+   Callback = function()
+      table.clear(visitedArtifacts)
+      collectArtifacts()
+      if ArtifactHighlightEnabled then refreshArtifactHighlights() end
+      print(string.format("[Coo Hub] สแกนเจอของทั้งหมด %d ชิ้น", #artifactCache))
+   end,
+})
+
+-- ---- Loop ----
+addConnection(RunService.Heartbeat:Connect(function()
+    local now = os.clock()
+
+    if AutoHuntEnabled then
+        if now - HuntLastAction >= HuntDelay then
+            HuntLastAction = now
+            pruneVisited()
+            huntStep()
+        end
+    end
+
+    if ArtifactHighlightEnabled and now - HighlightLastRefresh > 2 then
+        if now - artifactCacheAt > ARTIFACT_REFRESH then
+            collectArtifacts()
+        end
+        refreshArtifactHighlights()
+    end
+end))
+
+-- ============================================================
+--  ระบบ Unload: ปลด connection ทั้งหมด + ปิด UI ให้สะอาด
+-- ============================================================
+getgenv().CooHubUnload = function()
+    if ESPEnabled then
+        toggleESP(false)
+    end
+
+    -- หยุดระบบฟาร์มขุด + Anti-AFK
+    AutoDigEnabled = false
+    setAntiAFK(false)
+    table.clear(digTargets)
+
+    -- หยุดระบบวาปหาของหายาก + ลบไฮไลต์
+    AutoHuntEnabled = false
+    ArtifactHighlightEnabled = false
+    clearArtifactHighlights()
+    table.clear(artifactCache)
+    table.clear(visitedArtifacts)
+    lastHuntTarget = nil
+
+    for player in pairs(ESPData) do
+        removeESP(player)
+    end
+
+    for _, conn in ipairs(connections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    table.clear(connections)
+
+    pcall(function() Rayfield:Destroy() end)
+
+    getgenv().CooHubLoaded = false
+    getgenv().CooHubUnload = nil
+    print("[Coo Hub] Unloaded")
+end
