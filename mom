@@ -1,6 +1,7 @@
 -- ============================================================
---  Coo Hub V3.0  |  AIMBOT (รองรับมุมมองบุคคลที่ 1) + หาผู้เล่น
---  แท็บ: หน้าหลัก (เมนู) / Aimbot / หาผู้เล่น
+--  Coo Hub V3.2  |  AIMBOT (รองรับทั้งคอมและมือถือ)
+--  แท็บ: หน้าหลัก (เมนู + ตั้งค่ามือถือ) / Aimbot / หาผู้เล่น
+--  มือถือ: ใช้ปุ่ม AIM บนจอแทนคีย์บอร์ด, หมุนกล้องด้วยนิ้วได้
 -- ============================================================
 
 -- กันรันซ้ำ: ถ้าโหลดอยู่แล้วให้ปิดของเก่าก่อน
@@ -36,17 +37,189 @@ local function addConnection(conn)
     return conn
 end
 
+-- ประกาศล่วงหน้า (ตัวจริงอยู่ด้านล่างในส่วนต่าง ๆ)
+--  จำเป็นเพราะ MainTab ถูกสร้างก่อนระบบ Aimbot
+local resolveCharacter
+local Aimbot
+
 local function getRoot()
-    local char = LocalPlayer.Character
-    if not char then return nil, nil end
-    return char, char:FindFirstChild("HumanoidRootPart")
+    local char = resolveCharacter(LocalPlayer)
+    if not char or not char.Parent then return nil, nil end
+
+    local root = char:FindFirstChild("HumanoidRootPart")
+        or char:FindFirstChild("Torso")
+        or char:FindFirstChild("UpperTorso")
+        or char:FindFirstChild("Head")
+    return char, root
+end
+
+-- ============================================================
+--  ตรวจสอบอุปกรณ์ (เพื่อรองรับมือถือ)
+-- ============================================================
+--  มือถือมีข้อจำกัดที่ต้องแก้:
+--   1) ไม่มีคีย์บอร์ด -> ใช้ CreateKeybind ไม่ได้ ต้องมีปุ่มบนจอ
+--   2) UserInputService:GetMouseDelta() ใช้ไม่ได้ -> ต้องอ่านการลากนิ้ว
+--   3) mouse1click / VirtualUser ใช้ไม่ได้ -> ใช้ Tool:Activate() เท่านั้น
+--   4) บาง executor มือถือไม่มี Drawing -> ต้องมี ESP แบบ Highlight สำรอง
+-- ============================================================
+local IS_MOBILE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+local HAS_DRAWING = (type(Drawing) == "table" and type(Drawing.new) == "function")
+
+-- ---- สถานะระบบมือถือ ----
+local Mobile = {
+    Enabled    = IS_MOBILE,     -- ใช้ปุ่มบนจอแทนคีย์บอร์ด
+    ShowButton = IS_MOBILE,     -- แสดงปุ่ม AIM
+    ButtonHeld = false,
+    ButtonSize = 78,
+    X          = 0.82,
+    Y          = 0.72,
+    Gui        = nil,
+    Button     = nil,
+}
+
+-- สะสมการลากนิ้วสำหรับหมุนกล้องในโหมดยึดกล้องเอง (มือถือ)
+local touchLookX, touchLookY = 0, 0
+
+local function setMobileButtonHeld(held)
+    Mobile.ButtonHeld = held
+    if Mobile.Button then
+        Mobile.Button.BackgroundColor3 = held
+            and Color3.fromRGB(220, 50, 50)
+            or Color3.fromRGB(25, 25, 25)
+    end
+end
+
+local function updateMobileButtonVisibility()
+    if Mobile.Gui then
+        Mobile.Gui.Enabled = Mobile.ShowButton
+    end
+    if not Mobile.ShowButton then
+        setMobileButtonHeld(false)
+    end
+end
+
+local function applyMobileButtonPosition()
+    if Mobile.Button then
+        Mobile.Button.Position = UDim2.fromScale(Mobile.X, Mobile.Y)
+    end
+end
+
+-- สร้างปุ่ม AIM บนจอ (กดค้าง = เล็ง / ลาก = ย้ายปุ่ม)
+local function createMobileButton()
+    if Mobile.Gui then return true end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "CooHubMobile"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.Enabled = Mobile.ShowButton
+
+    local button = Instance.new("TextButton")
+    button.Name = "AimButton"
+    button.Size = UDim2.new(0, Mobile.ButtonSize, 0, Mobile.ButtonSize)
+    button.Position = UDim2.fromScale(Mobile.X, Mobile.Y)
+    button.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+    button.BackgroundTransparency = 0.25
+    button.Text = "AIM"
+    button.TextColor3 = Color3.fromRGB(255, 255, 255)
+    button.TextScaled = true
+    button.Font = Enum.Font.GothamBold
+    button.Active = true
+    button.AutoButtonColor = false
+    button.Parent = gui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(1, 0)
+    corner.Parent = button
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(255, 80, 80)
+    stroke.Thickness = 2
+    stroke.Parent = button
+
+    -- กดค้าง = เล็ง | ลากเกิน 12px = ย้ายปุ่ม (กันนิ้วสั่นเล็กน้อย)
+    local dragging, dragStart, startPos = false, nil, nil
+    button.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            dragStart = input.Position
+            startPos = button.Position
+            setMobileButtonHeld(true)
+        end
+    end)
+    button.InputChanged:Connect(function(input)
+        if not dragging or not dragStart then return end
+        if input.UserInputType ~= Enum.UserInputType.Touch
+            and input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+
+        local delta = input.Position - dragStart
+        local moved = math.abs(delta.X) + math.abs(delta.Y)
+
+        if moved > 12 then
+            -- ลากจัดว่าเป็นการย้ายปุ่ม ไม่ใช่การเล็ง
+            setMobileButtonHeld(false)
+            button.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+            Mobile.X = button.Position.X.Scale
+            Mobile.Y = button.Position.Y.Scale
+        end
+    end)
+    button.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+            dragStart = nil
+            setMobileButtonHeld(false)
+        end
+    end)
+
+    -- parent ลง PlayerGui แบบปลอดภัย (CoreGui มักไม่ให้สิทธิ์)
+    local ok = pcall(function() gui.Parent = LocalPlayer:WaitForChild("PlayerGui", 10) end)
+    if not ok or not gui.Parent then
+        warn("[Coo Hub] สร้างปุ่ม AIM บนจอไม่สำเร็จ")
+        gui:Destroy()
+        return false
+    end
+
+    Mobile.Gui = gui
+    Mobile.Button = button
+    return true
+end
+
+local function setMobileMode(enabled)
+    Mobile.Enabled = enabled
+    if enabled then
+        Mobile.ShowButton = true
+        createMobileButton()
+    end
+    -- เปิดโหมดมือถือ = บังคับใช้ปุ่มกดค้าง (กันเล็งตลอดเวลาโดยไม่ตั้งใจ)
+    if Aimbot then Aimbot.UseKeybind = enabled end
+    setMobileButtonHeld(false)
+    updateMobileButtonVisibility()
+end
+
+-- อ่านการลากนิ้ว ใช้หมุนกล้องตอนกล้องเป็น Scriptable
+addConnection(UserInputService.InputChanged:Connect(function(input)
+    if not Mobile.Enabled then return end
+    if input.UserInputType == Enum.UserInputType.Touch then
+        touchLookX = touchLookX + input.Delta.X
+        touchLookY = touchLookY + input.Delta.Y
+    end
+end))
+
+-- สร้างปุ่ม AIM ทันทีถ้ารันบนมือถือ (ไม่ต้องรอกด toggle)
+if IS_MOBILE then
+    createMobileButton()
 end
 
 -- ============================================================
 --  Window
 -- ============================================================
 local Window = Rayfield:CreateWindow({
-   Name = "Coo hub V3.0",
+   Name = "Coo hub V3.2",
    LoadingTitle = "Coo OT",
    LoadingSubtitle = "สร้างโดย COOHUB",
    ConfigurationSaving = {
@@ -72,12 +245,69 @@ MainTab:CreateSection("ข้อมูล")
 
 MainTab:CreateParagraph({
    Title = "เวอร์ชัน",
-   Content = "Coo Hub V3.0 (Aimbot + Player Finder)",
+   Content = "Coo Hub V3.2 (รองรับคอมพิวเตอร์และมือถือ)",
 })
 
 MainTab:CreateParagraph({
-   Title = "สิ่งที่เพิ่มในเวอร์ชันนี้",
-   Content = "• Aimbot ที่แก้ปัญหากล้องบุคคลที่ 1 แล้ว\n• ระบบหาผู้เล่น (ESP) + วาปไปหา\n• เล็งได้ทุกคนรวมทีมตัวเอง",
+   Title = "สิ่งที่แก้ในเวอร์ชันนี้",
+   Content = "• หาตัวละครจาก Workspace.Characters (เกมนี้เก็บตัวละครไว้ที่นั่น)\n• แยกทีมจากชื่อโฟลเดอร์ Counter-Terrorists / Terrorists\n• เพิ่มจุดเล็ง Hitbox และโหมดยึดกล้องเอง\n• รองรับมือถือ: ปุ่ม AIM บนจอ + หมุนกล้องด้วยนิ้ว\n• ESP สำรองด้วย Highlight สำหรับมือถือที่ไม่มี Drawing",
+})
+
+-- ============================================================
+--  ตั้งค่ามือถือ
+-- ============================================================
+MainTab:CreateSection("มือถือ (Mobile)")
+
+MainTab:CreateParagraph({
+   Title = "อุปกรณ์ที่ตรวจพบ",
+   Content = "อุปกรณ์: " .. (IS_MOBILE and "มือถือ/แท็บเล็ต" or "คอมพิวเตอร์")
+      .. "\nคีย์บอร์ด: " .. (UserInputService.KeyboardEnabled and "มี" or "ไม่มี")
+      .. "\nDrawing API (ESP): " .. (HAS_DRAWING and "มี" or "ไม่มี — ใช้ Highlight แทน")
+      .. "\nวิธีเล็งบนมือถือ: กดค้างที่ปุ่ม AIM บนจอ (ลากปุ่มเพื่อย้ายตำแหน่ง)",
+})
+
+MainTab:CreateToggle({
+   Name = "โหมดมือถือ (ใช้ปุ่ม AIM บนจอแทนคีย์บอร์ด)",
+   CurrentValue = IS_MOBILE,
+   Flag = "MobileModeToggle",
+   Callback = function(Value)
+      setMobileMode(Value)
+   end,
+})
+
+MainTab:CreateToggle({
+   Name = "แสดงปุ่ม AIM บนจอ",
+   CurrentValue = IS_MOBILE,
+   Flag = "MobileButtonToggle",
+   Callback = function(Value)
+      Mobile.ShowButton = Value
+      if Value then createMobileButton() end
+      updateMobileButtonVisibility()
+   end,
+})
+
+MainTab:CreateSlider({
+   Name = "ขนาดปุ่ม AIM",
+   Range = {50, 140},
+   Increment = 5,
+   Suffix = "px",
+   CurrentValue = 78,
+   Flag = "MobileButtonSizeSlider",
+   Callback = function(Value)
+      Mobile.ButtonSize = Value
+      if Mobile.Button then
+         Mobile.Button.Size = UDim2.new(0, Value, 0, Value)
+      end
+   end,
+})
+
+MainTab:CreateButton({
+   Name = "รีเซ็ตตำแหน่งปุ่ม AIM (มุมขวาล่าง)",
+   Callback = function()
+      Mobile.X = 0.82
+      Mobile.Y = 0.72
+      applyMobileButtonPosition()
+   end,
 })
 
 -- ============================================================
@@ -96,14 +326,18 @@ MainTab:CreateParagraph({
 local AIM_BIND_NAME = "CooHubAimbot"
 local FIND_BIND_NAME = "CooHubFinder"
 
+-- ค่ายิ่งสูง = รันยิ่งทีหลัง (เขียนทับกล้องเกมได้แน่นอนขึ้น)
+-- Enum.RenderPriority.Camera มีค่า 200 -> เริ่มต้นที่ 200 + 200 = 400
+local AIM_PRIORITY_OFFSET = 200
+
 -- ---- ค่าเริ่มต้นของ Aimbot ----
-local Aimbot = {
+Aimbot = {
     Enabled      = false,
-    UseKeybind   = false,
+    UseKeybind   = IS_MOBILE,     -- มือถือเริ่มต้นให้กดปุ่มค้างก่อนจึงเล็ง
     KeyHeld      = false,
     FOV          = 120,           -- 360 = ไม่จำกัดมุม
     TargetMode   = "ใกล้จุดเล็ง",  -- ใกล้จุดเล็ง | ใกล้ตัวที่สุด | เลือดน้อยสุด | เลือกเอง
-    AimPartName  = "Head",        -- Head | HumanoidRootPart | ลำตัว | ใกล้สุด
+    AimPartName  = "Head",        -- Head | HumanoidRootPart | ลำตัว | กล่องชน (Hitbox) | ใกล้สุด
     Speed        = 20,            -- ยิ่งมาก ยิ่งล็อกเร็ว
     Prediction   = 0.12,          -- ชดเชยการเคลื่อนที่ของเป้า
     VisibleOnly  = false,         -- เล็งเฉพาะที่มองเห็น (ไม่ทะลุกำแพง)
@@ -112,6 +346,8 @@ local Aimbot = {
     AutoFire     = false,
     FireDelay    = 0.1,
     ManualTarget = nil,
+    ScriptableMode = false,       -- ยึดกล้องเอง (ใช้เมื่อเกมเขียนทับกล้องเรา)
+    AimNPC       = false,         -- เล็ง NPC ในโฟลเดอร์ Characters ด้วย
 }
 
 local aimBound = false
@@ -132,46 +368,154 @@ local finderBound = false
 -- ============================================================
 --  Helper
 -- ============================================================
-local AIM_PART_OPTIONS = { "Head", "HumanoidRootPart", "ลำตัว", "ใกล้สุด" }
-local TORSO_NAMES = { "UpperTorso", "Torso", "LowerTorso" }
+-- จุดเล็งที่เลือกได้ -> ลำดับชื่อชิ้นส่วนที่จะลองหาทีละชื่อ
+local AIM_PART_CHAINS = {
+    ["Head"]             = { "Head", "head" },
+    ["HumanoidRootPart"] = { "HumanoidRootPart" },
+    ["ลำตัว"]             = { "UpperTorso", "Torso", "LowerTorso", "Chest", "HumanoidRootPart" },
+    ["กล่องชน (Hitbox)"]  = { "Hitbox", "HitBox", "hitbox", "HumanoidRootPart" },
+}
+local AIM_PART_OPTIONS = { "Head", "HumanoidRootPart", "ลำตัว", "กล่องชน (Hitbox)", "ใกล้สุด" }
+
+-- ============================================================
+--  หาตัวละคร / แยกทีม (สำคัญสำหรับเกมนี้)
+--  เกมนี้เก็บตัวละครไว้ที่ Workspace.Characters แยกเป็นโฟลเดอร์ทีม
+--    Workspace.Characters.Counter-Terrorists
+--    Workspace.Characters.Terrorists
+--    Workspace.Characters.Hostages
+--  จึงต้องหาโฟลเดอร์และอ่านชื่อทีมจาก "ชื่อโฟลเดอร์แม่" เป็นหลัก
+--  เพราะ player.Team ของเกมนี้เชื่อถือไม่ได้เสมอ
+-- ============================================================
+local CHAR_FOLDER_NAME = "Characters"
+local CHAR_MAP_REFRESH = 1.5
+local charMap = {}          -- [ชื่อโมเดล] = Model
+local charMapAt = 0
+
+local function getCharactersFolder()
+    local folder = Workspace:FindFirstChild(CHAR_FOLDER_NAME)
+    if folder then return folder end
+
+    -- เผื่อเกมเปลี่ยนชื่อโฟลเดอร์
+    for _, obj in ipairs(Workspace:GetChildren()) do
+        if obj:IsA("Folder") and string.find(string.lower(obj.Name), "character", 1, true) then
+            return obj
+        end
+    end
+    return nil
+end
+
+local function rebuildCharMap()
+    charMap = {}
+    local folder = getCharactersFolder()
+    if folder then
+        for _, obj in ipairs(folder:GetDescendants()) do
+            if obj:IsA("Model") and obj:FindFirstChildOfClass("Humanoid") then
+                if charMap[obj.Name] == nil then
+                    charMap[obj.Name] = obj
+                end
+            end
+        end
+    end
+    charMapAt = os.clock()
+end
+
+-- หาโมเดลตัวละครของผู้เล่น (รองรับทั้ง player.Character และโฟลเดอร์ Characters)
+resolveCharacter = function(player)
+    if not player then return nil, nil end
+
+    local char = player.Character
+    if char and char.Parent then return char, "player.Character" end
+
+    if os.clock() - charMapAt > CHAR_MAP_REFRESH then
+        rebuildCharMap()
+    end
+
+    local found = charMap[player.Name]
+    if found and found.Parent then
+        return found, "Characters"
+    end
+    return nil, nil
+end
+
+-- อ่านชื่อทีมจากชื่อโฟลเดอร์แม่ของตัวละคร
+local function getCharacterTeamName(char)
+    local node = char and char.Parent
+    for _ = 1, 4 do
+        if not node or node == Workspace then break end
+        local lower = string.lower(node.Name)
+        if string.find(lower, "counter", 1, true) then return "Counter-Terrorists" end
+        if string.find(lower, "terror", 1, true) then return "Terrorists" end
+        if string.find(lower, "hostage", 1, true) then return "Hostages" end
+        node = node.Parent
+    end
+    return nil
+end
+
+local function isCharAlive(char)
+    if not char or not char.Parent then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    return hum ~= nil and hum.Health > 0
+end
+
+local function getAliveChar(player)
+    local char = resolveCharacter(player)
+    if not isCharAlive(char) then return nil end
+    return char
+end
+
+-- เทียบว่าอยู่ทีมเดียวกับเราหรือไม่ (อิงโฟลเดอร์ก่อน แล้วค่อยอิง player.Team)
+local function isSameTeamAsMe(player)
+    local myChar = LocalPlayer.Character
+    local myTeam = myChar and getCharacterTeamName(myChar)
+    local theirTeam = getCharacterTeamName(getAliveChar(player))
+
+    if myTeam and theirTeam then
+        return myTeam == theirTeam
+    end
+
+    if player.Team and LocalPlayer.Team then
+        return player.Team == LocalPlayer.Team
+    end
+    return false
+end
 
 local function getCamera()
     return Workspace.CurrentCamera
 end
 
-local function getAliveChar(player)
-    local char = player.Character
-    if not char or not char.Parent then return nil end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    if not hum or hum.Health <= 0 then return nil end
-    return char
+-- หาชิ้นส่วนแรกที่เจอจากรายชื่อ
+local function firstFound(char, names)
+    for _, partName in ipairs(names) do
+        local part = char:FindFirstChild(partName)
+        if part and part:IsA("BasePart") then return part end
+    end
+    return nil
 end
 
--- หาชิ้นส่วนที่จะเล็ง (รองรับทั้ง R6 และ R15)
+-- หาชิ้นส่วนที่จะเล็ง (รองรับ R6 / R15 / หุ่นของเกมนี้)
 local function resolveAimPart(char, fromPos)
+    if not char then return nil end
+
     local mode = Aimbot.AimPartName
 
-    if mode == "Head" then
-        return char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart")
-    elseif mode == "HumanoidRootPart" then
-        return char:FindFirstChild("HumanoidRootPart")
-    elseif mode == "ลำตัว" then
-        for _, partName in ipairs(TORSO_NAMES) do
-            local part = char:FindFirstChild(partName)
-            if part then return part end
+    if mode == "ใกล้สุด" then
+        local best, bestDist = nil, math.huge
+        for _, obj in ipairs(char:GetChildren()) do
+            if obj:IsA("BasePart") then
+                local dist = (obj.Position - fromPos).Magnitude
+                if dist < bestDist then bestDist, best = dist, obj end
+            end
         end
-        return char:FindFirstChild("HumanoidRootPart")
+        return best or firstFound(char, { "HumanoidRootPart", "Head", "Torso" })
     end
 
-    -- ใกล้สุด: เลือก BasePart ที่ใกล้กล้องที่สุด
-    local best, bestDist = nil, math.huge
-    for _, obj in ipairs(char:GetChildren()) do
-        if obj:IsA("BasePart") then
-            local dist = (obj.Position - fromPos).Magnitude
-            if dist < bestDist then bestDist, best = dist, obj end
-        end
-    end
-    return best
+    local chain = AIM_PART_CHAINS[mode]
+    local part = chain and firstFound(char, chain)
+    if part then return part end
+
+    -- fallback สุดท้าย: หาจุดที่พอเล็งได้
+    return firstFound(char, { "Head", "HumanoidRootPart", "Torso", "UpperTorso" })
+        or char:FindFirstChildWhichIsA("BasePart")
 end
 
 local function isTargetAllowed(player)
@@ -179,9 +523,7 @@ local function isTargetAllowed(player)
     if not player.Parent then return false end
     if not Aimbot.AimAll then
         -- ปิดอยู่ = เล็งเฉพาะศัตรู ไม่รวมพวกทีมเดียวกัน
-        if player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team then
-            return false
-        end
+        if isSameTeamAsMe(player) then return false end
     end
     return true
 end
@@ -218,6 +560,44 @@ local function getPredictedPos(part)
     return pos
 end
 
+-- รวมเป้าทั้งหมด: ผู้เล่น + (ถ้าเปิด) NPC ในโฟลเดอร์ Characters
+local function collectTargets()
+    local list = {}
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if isTargetAllowed(player) then
+            local char = getAliveChar(player)
+            if char then
+                list[#list + 1] = { player = player, char = char }
+            end
+        end
+    end
+
+    if Aimbot.AimNPC then
+        local folder = getCharactersFolder()
+        if folder then
+            for _, obj in ipairs(folder:GetDescendants()) do
+                if obj:IsA("Model") and obj ~= LocalPlayer.Character
+                    and not Players:GetPlayerFromCharacter(obj) and isCharAlive(obj) then
+                    -- กันนับซ้ำ: ถ้าชื่อโมเดลตรงกับชื่อผู้เล่นในเกม = เป็นตัวละครผู้เล่น
+                    local isPlayerModel = false
+                    for _, player in ipairs(Players:GetPlayers()) do
+                        if player.Name == obj.Name then
+                            isPlayerModel = true
+                            break
+                        end
+                    end
+                    if not isPlayerModel then
+                        list[#list + 1] = { player = nil, char = obj }
+                    end
+                end
+            end
+        end
+    end
+
+    return list
+end
+
 -- ============================================================
 --  เลือกเป้าหมายที่ดีที่สุด
 -- ============================================================
@@ -230,43 +610,39 @@ local function getBestTarget(fromPos, forward)
         return nil, nil
     end
 
-    for _, player in ipairs(Players:GetPlayers()) do
-        local skip = false
+    for _, entry in ipairs(collectTargets()) do
+        local char = entry.char
+        local allowed = true
 
-        if not isTargetAllowed(player) then
-            skip = true
-        elseif Aimbot.TargetMode == "เลือกเอง" and player ~= Aimbot.ManualTarget then
-            skip = true
+        if Aimbot.TargetMode == "เลือกเอง" then
+            allowed = entry.player ~= nil and entry.player == Aimbot.ManualTarget
         end
 
-        if not skip then
-            local char = getAliveChar(player)
-            if char then
-                local part = resolveAimPart(char, fromPos)
-                if part then
-                    local dir = part.Position - fromPos
-                    local dist = dir.Magnitude
-                    if dist > 0.1 then
-                        local angle = math.deg(math.acos(math.clamp(forward:Dot(dir.Unit), -1, 1)))
-                        if angle <= maxAngle then
-                            local visible = true
-                            if Aimbot.VisibleOnly then
-                                visible = isPartVisible(part, fromPos)
+        if allowed then
+            local part = resolveAimPart(char, fromPos)
+            if part then
+                local dir = part.Position - fromPos
+                local dist = dir.Magnitude
+                if dist > 0.1 then
+                    local angle = math.deg(math.acos(math.clamp(forward:Dot(dir.Unit), -1, 1)))
+                    if angle <= maxAngle then
+                        local visible = true
+                        if Aimbot.VisibleOnly then
+                            visible = isPartVisible(part, fromPos)
+                        end
+                        if visible then
+                            local score
+                            if Aimbot.TargetMode == "ใกล้ตัวที่สุด" then
+                                score = dist
+                            elseif Aimbot.TargetMode == "เลือดน้อยสุด" then
+                                local hum = char:FindFirstChildOfClass("Humanoid")
+                                score = hum and hum.Health or math.huge
+                            else
+                                -- ใกล้จุดเล็ง (ค่าเริ่มต้น) / เลือกเอง
+                                score = angle
                             end
-                            if visible then
-                                local score
-                                if Aimbot.TargetMode == "ใกล้ตัวที่สุด" then
-                                    score = dist
-                                elseif Aimbot.TargetMode == "เลือดน้อยสุด" then
-                                    local hum = char:FindFirstChildOfClass("Humanoid")
-                                    score = hum and hum.Health or math.huge
-                                else
-                                    -- ใกล้จุดเล็ง (ค่าเริ่มต้น) / เลือกเอง
-                                    score = angle
-                                end
-                                if score < bestScore then
-                                    bestScore, best, bestPart = score, player, part
-                                end
+                            if score < bestScore then
+                                bestScore, best, bestPart = score, entry.player, part
                             end
                         end
                     end
@@ -281,12 +657,35 @@ end
 local function fireTool()
     local char = LocalPlayer.Character
     if not char then return end
+
+    -- Tool:Activate() ใช้ได้ทุกแพลตฟอร์ม จึงเป็นวิธีหลัก
     local tool = char:FindFirstChildOfClass("Tool")
     if tool then
         pcall(function() tool:Activate() end)
-    else
-        pcall(function() mouse1click() end)
+        return
     end
+
+    -- ไม่มี Tool: ทำได้แค่บนคอม (มือถือเรียกไม่ได้)
+    if Mobile.Enabled then return end
+
+    if type(mouse1click) == "function" then
+        pcall(mouse1click)
+    else
+        pcall(function()
+            local virtualUser = game:GetService("VirtualUser")
+            virtualUser:CaptureController()
+            virtualUser:ClickButton1(Vector2.new())
+        end)
+    end
+end
+
+-- ตรวจว่าผู้เล่นกำลังกดเล็งอยู่ไหม
+--  มือถือ = กดปุ่ม AIM ค้างบนจอ | คอม = กดคีย์บาร์ดค้าง
+local function isAimHeld()
+    if Mobile.Enabled then
+        return Mobile.ButtonHeld
+    end
+    return Aimbot.KeyHeld
 end
 
 -- ============================================================
@@ -294,7 +693,7 @@ end
 -- ============================================================
 local function updateAimbot(dt)
     if not Aimbot.Enabled then return end
-    if Aimbot.UseKeybind and not Aimbot.KeyHeld then
+    if Aimbot.UseKeybind and not isAimHeld() then
         currentAimTarget = nil
         return
     end
@@ -305,13 +704,45 @@ local function updateAimbot(dt)
     local myChar, myRoot = getRoot()
     if not myChar or not myRoot then return end
 
-    -- สำคัญ: คง "ตำแหน่งกล้องเดิม" ไว้ แก้แค่ทิศทาง
-    local fromPos = cam.CFrame.Position
-    local forward = cam.CFrame.LookVector
+    local fromPos, forward
+
+    if Aimbot.ScriptableMode then
+        -- โหมดยึดกล้องเอง: วางกล้องที่หัว แล้วหมุนเองทั้งหมด
+        -- ใช้เมื่อเกมเขียนทับกล้องไม่ว่าเราจะผูก priority สูงแค่ไหน
+        local head = myChar:FindFirstChild("Head") or myChar:FindFirstChild("head")
+        fromPos = head and head.Position or (myRoot.Position + Vector3.new(0, 1.5, 0))
+        if cam.CameraType ~= Enum.CameraType.Scriptable then
+            pcall(function() cam.CameraType = Enum.CameraType.Scriptable end)
+        end
+        forward = cam.CFrame.LookVector
+    else
+        -- คงตำแหน่งกล้องเดิมไว้ แก้แค่ทิศทางการหัน (ไม่ให้หลุดมุมมองบุคคลที่ 1)
+        fromPos = cam.CFrame.Position
+        forward = cam.CFrame.LookVector
+    end
 
     local target, targetPart = getBestTarget(fromPos, forward)
     currentAimTarget = target
-    if not target or not targetPart then return end
+
+    if not targetPart then
+        -- ไม่มีเป้า: โหมดยึดกล้องยังต้องตรึงกล้องที่หัว + ให้ผู้เล่นหันเองได้
+        if Aimbot.ScriptableMode then
+            local dx, dy
+            if Mobile.Enabled then
+                -- มือถือ: ใช้การลากนิ้วที่สะสมไว้จาก InputChanged
+                dx, dy = touchLookX, touchLookY
+                touchLookX, touchLookY = 0, 0
+            else
+                local delta = UserInputService:GetMouseDelta()
+                dx, dy = delta.X, delta.Y
+            end
+
+            local rot = cam.CFrame - cam.CFrame.Position
+            rot = rot * CFrame.Angles(math.rad(-dy * 0.35), math.rad(-dx * 0.35), 0)
+            cam.CFrame = CFrame.new(fromPos) * rot
+        end
+        return
+    end
 
     local dest = getPredictedPos(targetPart)
     if (dest - fromPos).Magnitude < 0.3 then return end
@@ -342,8 +773,11 @@ end
 
 local function setAimbotBound(enabled)
     if enabled and not aimBound then
+        -- ผูกที่ priority สูงกว่า Enum.RenderPriority.Camera (200)
+        -- เพื่อให้รัน "หลัง" สคริปต์กล้องของเกม ค่า CFrame ของเราจึงชนะ
+        local priority = Enum.RenderPriority.Camera.Value + AIM_PRIORITY_OFFSET
         local ok = pcall(function()
-            RunService:BindToRenderStep(AIM_BIND_NAME, Enum.RenderPriority.Camera.Value + 1, updateAimbot)
+            RunService:BindToRenderStep(AIM_BIND_NAME, priority, updateAimbot)
         end)
         if ok then
             aimBound = true
@@ -354,57 +788,131 @@ local function setAimbotBound(enabled)
         pcall(function() RunService:UnbindFromRenderStep(AIM_BIND_NAME) end)
         aimBound = false
         currentAimTarget = nil
+
+        -- คืนกล้องให้เกม ถ้าเคยยึดกล้องเอง
+        local cam = getCamera()
+        if cam and cam.CameraType == Enum.CameraType.Scriptable then
+            pcall(function() cam.CameraType = Enum.CameraType.Custom end)
+        end
     end
 end
 
 -- ============================================================
 --  ระบบหาผู้เล่น (ESP)
+--  มี 2 โหมด:
+--   1) Drawing  — สวยกว่า ใช้ได้บนคอมและมือถือบางตัว
+--   2) Highlight — สำรองสำหรับมือถือที่ไม่มี Drawing
 -- ============================================================
 local function createFinder(player)
     if player == LocalPlayer then return end
     if finderData[player] then return end
 
-    local box = Drawing.new("Square")
-    box.Visible = false
-    box.Thickness = 1
-    box.Transparency = 1
-    box.Filled = false
-    box.Color = Color3.fromRGB(255, 60, 60)
+    if HAS_DRAWING then
+        local box = Drawing.new("Square")
+        box.Visible = false
+        box.Thickness = 1
+        box.Transparency = 1
+        box.Filled = false
+        box.Color = Color3.fromRGB(255, 60, 60)
 
-    local nameLabel = Drawing.new("Text")
-    nameLabel.Visible = false
-    nameLabel.Size = 15
-    nameLabel.Center = true
-    nameLabel.Outline = true
-    nameLabel.OutlineColor = Color3.fromRGB(0, 0, 0)
-    nameLabel.Font = 3
-    nameLabel.Color = Color3.fromRGB(255, 255, 255)
+        local nameLabel = Drawing.new("Text")
+        nameLabel.Visible = false
+        nameLabel.Size = 15
+        nameLabel.Center = true
+        nameLabel.Outline = true
+        nameLabel.OutlineColor = Color3.fromRGB(0, 0, 0)
+        nameLabel.Font = 3
+        nameLabel.Color = Color3.fromRGB(255, 255, 255)
 
-    local distLabel = Drawing.new("Text")
-    distLabel.Visible = false
-    distLabel.Size = 13
-    distLabel.Center = true
-    distLabel.Outline = true
-    distLabel.OutlineColor = Color3.fromRGB(0, 0, 0)
-    distLabel.Font = 3
-    distLabel.Color = Color3.fromRGB(255, 255, 0)
+        local distLabel = Drawing.new("Text")
+        distLabel.Visible = false
+        distLabel.Size = 13
+        distLabel.Center = true
+        distLabel.Outline = true
+        distLabel.OutlineColor = Color3.fromRGB(0, 0, 0)
+        distLabel.Font = 3
+        distLabel.Color = Color3.fromRGB(255, 255, 0)
 
-    finderData[player] = { box = box, nameLabel = nameLabel, distLabel = distLabel }
+        finderData[player] = {
+            mode = "drawing",
+            box = box,
+            nameLabel = nameLabel,
+            distLabel = distLabel,
+        }
+        return
+    end
+
+    -- ---- โหมดสำรอง: Highlight + ป้ายชื่อ ----
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "CooHubESPHighlight"
+    highlight.FillTransparency = 0.65
+    highlight.OutlineTransparency = 0
+    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.Enabled = false
+    highlight.Parent = Workspace
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "CooHubESPTag"
+    billboard.Size = UDim2.new(0, 200, 0, 36)
+    billboard.StudsOffsetWorldSpace = Vector3.new(0, 2.8, 0)
+    billboard.AlwaysOnTop = true
+    billboard.Enabled = false
+
+    local label = Instance.new("TextLabel")
+    label.Name = "Info"
+    label.Size = UDim2.fromScale(1, 1)
+    label.BackgroundTransparency = 1
+    label.TextScaled = false
+    label.TextSize = 14
+    label.TextStrokeTransparency = 0
+    label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+    label.Font = Enum.Font.GothamBold
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.Parent = billboard
+
+    local ok = pcall(function()
+        billboard.Parent = LocalPlayer:WaitForChild("PlayerGui", 10)
+    end)
+    if not ok or not billboard.Parent then
+        pcall(function() highlight:Destroy() end)
+        pcall(function() billboard:Destroy() end)
+        return
+    end
+
+    finderData[player] = {
+        mode = "instance",
+        highlight = highlight,
+        billboard = billboard,
+        label = label,
+    }
 end
 
 local function removeFinder(player)
     local data = finderData[player]
     if not data then return end
-    for _, obj in pairs(data) do
-        pcall(function() obj:Remove() end)
+
+    if data.mode == "drawing" then
+        for _, key in ipairs({ "box", "nameLabel", "distLabel" }) do
+            local obj = data[key]
+            if obj then pcall(function() obj:Remove() end) end
+        end
+    else
+        if data.highlight then pcall(function() data.highlight:Destroy() end) end
+        if data.billboard then pcall(function() data.billboard:Destroy() end) end
     end
+
     finderData[player] = nil
 end
 
 local function hideFinder(data)
-    data.box.Visible = false
-    data.nameLabel.Visible = false
-    data.distLabel.Visible = false
+    if data.mode == "drawing" then
+        data.box.Visible = false
+        data.nameLabel.Visible = false
+        data.distLabel.Visible = false
+    else
+        if data.highlight then data.highlight.Enabled = false end
+        if data.billboard then data.billboard.Enabled = false end
+    end
 end
 
 local function updateFinder()
@@ -415,8 +923,13 @@ local function updateFinder()
 
     for player, data in pairs(finderData) do
         local char = getAliveChar(player)
-        local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        local head = char and char:FindFirstChild("Head")
+        local hrp = char and (char:FindFirstChild("HumanoidRootPart")
+            or char:FindFirstChild("Torso")
+            or char:FindFirstChild("UpperTorso")
+            or char:FindFirstChild("Head"))
+        local head = char and (char:FindFirstChild("Head")
+            or char:FindFirstChild("head")
+            or hrp)
 
         if not (char and hrp and head) then
             hideFinder(data)
@@ -429,6 +942,38 @@ local function updateFinder()
             continue
         end
 
+        -- สี: เป้าที่เล็งอยู่ = เหลือง, ทีมเดียวกัน = เขียว, ศัตรู = แดง
+        local color
+        if player == currentAimTarget then
+            color = Color3.fromRGB(255, 230, 0)
+        elseif isSameTeamAsMe(player) then
+            color = Color3.fromRGB(70, 235, 90)
+        else
+            color = Color3.fromRGB(255, 60, 60)
+        end
+
+        local suffix = ""
+        if Finder.ShowTeam then
+            local teamName = getCharacterTeamName(char) or (player.Team and player.Team.Name)
+            suffix = teamName and (" [" .. teamName .. "]") or ""
+        end
+        local title = player.Name .. suffix
+
+        -- ---- โหมดสำรอง (มือถือที่ไม่มี Drawing) ----
+        if data.mode == "instance" then
+            data.highlight.Adornee = char
+            data.highlight.FillColor = color
+            data.highlight.OutlineColor = color
+            data.highlight.Enabled = Finder.ShowBox
+
+            data.billboard.Adornee = head
+            data.label.Text = title .. (Finder.ShowDistance and string.format("  %.0f studs", dist) or "")
+            data.label.TextColor3 = color
+            data.billboard.Enabled = true
+            continue
+        end
+
+        -- ---- โหมด Drawing ----
         local rootScreen, onScreen = cam:WorldToViewportPoint(hrp.Position)
         if not onScreen then
             hideFinder(data)
@@ -436,16 +981,6 @@ local function updateFinder()
         end
 
         local headScreen = cam:WorldToViewportPoint(head.Position)
-
-        -- สี: เป้าที่เล็งอยู่ = เหลือง, ทีมเดียวกัน = เขียว, ศัตรู = แดง
-        local color
-        if player == currentAimTarget then
-            color = Color3.fromRGB(255, 230, 0)
-        elseif player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team then
-            color = Color3.fromRGB(70, 235, 90)
-        else
-            color = Color3.fromRGB(255, 60, 60)
-        end
 
         local height = math.max(math.abs(headScreen.Y - rootScreen.Y) * 1.6, 24)
         local width = height * 0.5
@@ -456,11 +991,7 @@ local function updateFinder()
         data.box.Color = color
         data.box.Visible = Finder.ShowBox
 
-        local suffix = ""
-        if Finder.ShowTeam then
-            suffix = player.Team and (" [" .. player.Team.Name .. "]") or ""
-        end
-        data.nameLabel.Text = player.Name .. suffix
+        data.nameLabel.Text = title
         data.nameLabel.Color = color
         data.nameLabel.Position = Vector2.new(rootScreen.X, boxPos.Y - 18)
         data.nameLabel.Visible = true
@@ -516,6 +1047,65 @@ local function findPlayerByName(name)
 end
 
 -- ============================================================
+--  วินิจฉัยระบบ (กดแล้วดูผลใน Console F9 ถ้ารันไม่ติด)
+-- ============================================================
+local function runDiagnostics()
+    local function log(text)
+        print("[Coo Hub] " .. text)
+    end
+
+    log("========== COO HUB DIAGNOSTICS ==========")
+
+    local cam = getCamera()
+    log("Camera: " .. (cam and cam.Name or "ไม่พบ"))
+    log("CameraType: " .. (cam and tostring(cam.CameraType) or "-"))
+    log("Priority ที่ผูกไว้: " .. tostring(Enum.RenderPriority.Camera.Value + AIM_PRIORITY_OFFSET))
+    log("Aimbot ผูกอยู่: " .. tostring(aimBound) .. " | Finder ผูกอยู่: " .. tostring(finderBound))
+
+    local myChar = resolveCharacter(LocalPlayer)
+    log("ตัวละครตัวเอง: " .. (myChar and myChar:GetFullName() or "ไม่พบ (สำคัญ!)"))
+    log("ทีมตัวเอง: " .. tostring((myChar and getCharacterTeamName(myChar))
+        or (LocalPlayer.Team and LocalPlayer.Team.Name) or "-"))
+
+    local folder = getCharactersFolder()
+    log("โฟลเดอร์ Characters: " .. (folder and folder:GetFullName() or "ไม่พบ"))
+
+    if folder then
+        local count = 0
+        for _, obj in ipairs(folder:GetDescendants()) do
+            if obj:IsA("Model") and obj:FindFirstChildOfClass("Humanoid") then
+                count = count + 1
+            end
+        end
+        log("จำนวนตัวละครในโฟลเดอร์: " .. tostring(count))
+    end
+
+    local fromPos = cam and cam.CFrame.Position or Vector3.zero
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local char = resolveCharacter(player)
+            local part = char and resolveAimPart(char, fromPos)
+            log(string.format("%s | ตัวละคร: %s | ทีม: %s | จุดเล็ง: %s | ระยะ: %.0f studs",
+                player.Name,
+                char and "เจอ" or "ไม่เจอ",
+                tostring((char and getCharacterTeamName(char)) or (player.Team and player.Team.Name) or "-"),
+                part and part.Name or "-",
+                part and (part.Position - fromPos).Magnitude or 0))
+        end
+    end
+
+    log("=========================================")
+
+    Rayfield:Notify({
+        Title = "Coo Hub - วินิจฉัยระบบ",
+        Content = string.format("ตัวละครตัวเอง: %s\nโฟลเดอร์ Characters: %s\n(ดูรายละเอียดเต็มใน Console F9)",
+            myChar and "เจอ" or "ไม่เจอ",
+            folder and "เจอ" or "ไม่เจอ"),
+        Duration = 8,
+    })
+end
+
+-- ============================================================
 --  TAB: Aimbot
 -- ============================================================
 local AimbotTab = Window:CreateTab("Aimbot", nil)
@@ -523,7 +1113,7 @@ AimbotTab:CreateSection("ระบบเล็งอัตโนมัติ")
 
 AimbotTab:CreateParagraph({
    Title = "แก้ปัญหาเกมมุมมองบุคคลที่ 1",
-   Content = "ระบบนี้เขียนกล้องที่ RenderPriority.Camera + 1\nคือรัน 'หลัง' สคริปต์กล้องของเกม จึงไม่ถูกล็อกทับ\nและคงตำแหน่งกล้องเดิมไว้ แก้แค่ทิศทางการหัน",
+   Content = "ระบบเขียนกล้องที่ priority สูงกว่า Enum.RenderPriority.Camera (200)\nคือรัน 'หลัง' สคริปต์กล้องของเกม จึงไม่ถูกเขียนทับ\nถ้ายังล็อกไม่ติด ให้เพิ่มค่า Priority หรือเปิดโหมดยึดกล้องเอง",
 })
 
 AimbotTab:CreateToggle({
@@ -650,6 +1240,60 @@ AimbotTab:CreateToggle({
    end,
 })
 
+AimbotTab:CreateSection("ปรับให้เข้ากับเกมนี้ (CS-style)")
+
+AimbotTab:CreateParagraph({
+   Title = "ทำไมต้องมีส่วนนี้",
+   Content = "เกมนี้เก็บตัวละครไว้ที่ Workspace.Characters แยกโฟลเดอร์ทีม\n(Counter-Terrorists / Terrorists / Hostages)\nระบบอ่านทีมจากชื่อโฟลเดอร์นี้ จึงแยกเพื่อน/ศัตรูได้ถูกต้อง",
+})
+
+AimbotTab:CreateToggle({
+   Name = "โหมดยึดกล้องเอง (Scriptable) — ใช้ถ้าล็อกไม่ติด",
+   CurrentValue = false,
+   Flag = "AimbotScriptableToggle",
+   Callback = function(Value)
+      Aimbot.ScriptableMode = Value
+      if not Value then
+         local cam = getCamera()
+         if cam and cam.CameraType == Enum.CameraType.Scriptable then
+            pcall(function() cam.CameraType = Enum.CameraType.Custom end)
+         end
+      end
+   end,
+})
+
+AimbotTab:CreateSlider({
+   Name = "ลำดับความสำคัญกล้อง (Priority)",
+   Range = {10, 1000},
+   Increment = 10,
+   Suffix = "+ Camera",
+   CurrentValue = 200,
+   Flag = "AimbotPrioritySlider",
+   Callback = function(Value)
+      AIM_PRIORITY_OFFSET = Value
+      if aimBound then
+         setAimbotBound(false)
+         setAimbotBound(true)
+      end
+   end,
+})
+
+AimbotTab:CreateToggle({
+   Name = "เล็ง NPC ด้วย (หุ่น/Hostages ในโฟลเดอร์ Characters)",
+   CurrentValue = false,
+   Flag = "AimbotNpcToggle",
+   Callback = function(Value)
+      Aimbot.AimNPC = Value
+   end,
+})
+
+AimbotTab:CreateButton({
+   Name = "วินิจฉัยระบบ (Diagnostics)",
+   Callback = function()
+      runDiagnostics()
+   end,
+})
+
 AimbotTab:CreateSection("การยิง")
 
 AimbotTab:CreateToggle({
@@ -712,6 +1356,13 @@ end))
 -- ============================================================
 local FinderTab = Window:CreateTab("หาผู้เล่น", nil)
 FinderTab:CreateSection("ระบบหาผู้เล่น (ESP)")
+
+FinderTab:CreateParagraph({
+   Title = "โหมดการแสดงผล",
+   Content = HAS_DRAWING
+      and "ใช้ Drawing API (กรอบ + ชื่อ + ระยะทาง)"
+      or "อุปกรณ์นี้ไม่มี Drawing — ใช้ Highlight + ป้ายชื่อแทน",
+})
 
 FinderTab:CreateToggle({
    Name = "แสดงตำแหน่งผู้เล่น",
@@ -782,8 +1433,10 @@ FinderTab:CreateButton({
          return
       end
       local _, myRoot = getRoot()
-      local tChar = target.Character
-      local tRoot = tChar and tChar:FindFirstChild("HumanoidRootPart")
+      local tChar = resolveCharacter(target)
+      local tRoot = tChar and (tChar:FindFirstChild("HumanoidRootPart")
+          or tChar:FindFirstChild("Torso")
+          or tChar:FindFirstChild("UpperTorso"))
       if not myRoot or not tRoot then
          Rayfield:Notify({ Title = "Coo Hub", Content = "หาตัวเป้าหมายไม่เจอ", Duration = 3 })
          return
@@ -826,9 +1479,23 @@ getgenv().CooHubUnload = function()
     Aimbot.Enabled = false
     setAimbotBound(false)
 
+    -- คืนกล้องให้เกม (กรณีเปิดโหมดยึดกล้องเองไว้)
+    local cam = getCamera()
+    if cam and cam.CameraType == Enum.CameraType.Scriptable then
+        pcall(function() cam.CameraType = Enum.CameraType.Custom end)
+    end
+
     Finder.Enabled = false
     setFinderBound(false)
     table.clear(finderData)
+
+    -- ลบปุ่ม AIM บนจอ (สำคัญสำหรับมือถือ)
+    setMobileButtonHeld(false)
+    if Mobile.Gui then
+        pcall(function() Mobile.Gui:Destroy() end)
+        Mobile.Gui = nil
+        Mobile.Button = nil
+    end
 
     for _, conn in ipairs(connections) do
         pcall(function() conn:Disconnect() end)
